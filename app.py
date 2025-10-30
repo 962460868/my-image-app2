@@ -186,7 +186,11 @@ def download_result_image(url):
     return response.content
 
 def process_single_task(task, api_key, webapp_id, node_info):
-    """处理单个任务"""
+    """处理单个任务
+    
+    注意：这个函数在子线程中运行，不能直接访问 st.session_state
+    只能修改传入的 task 对象的属性
+    """
     try:
         task.status = "UPLOADING"
         task.start_time = time.time()
@@ -196,7 +200,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
         uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
         task.progress = 15
         
-        # ✅ 修复：使用深拷贝避免修改原始NODE_INFO
+        # ✅ 修复1：使用深拷贝避免修改原始NODE_INFO
         node_info_list = copy.deepcopy(node_info)
         for node in node_info_list:
             if node["nodeId"] == "38":
@@ -238,9 +242,9 @@ def process_single_task(task, api_key, webapp_id, node_info):
         task.status = "FAILED"
         task.error_message = str(e)
         task.elapsed_time = time.time() - task.start_time if task.start_time else 0
-    finally:
-        # 处理完成后减少计数
-        st.session_state.processing_count = max(0, st.session_state.processing_count - 1)
+    
+    # ✅ 修复2：不在子线程中访问 st.session_state
+    # 计数器的管理完全由主线程负责
 
 def get_image_download_link(img_data, filename):
     """生成图片下载链接"""
@@ -252,7 +256,7 @@ def get_image_download_link(img_data, filename):
 st.title("🎨 RunningHub AI - 智能图片优化工具")
 st.markdown("### 支持批量队列处理，最多同时处理3张图片")
 
-# 统计信息
+# 统计信息（在主线程中计算）
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     queued = sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
@@ -315,17 +319,21 @@ with right_col:
     if not st.session_state.tasks:
         st.info("暂无任务，请上传图片开始处理")
     else:
+        # ✅ 修复3：在主线程中管理并发计数
+        # 统计当前实际处理中的任务数量
+        current_processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
+        
         # 处理队列中的任务
         for task in st.session_state.tasks:
-            if task.status == "QUEUED" and st.session_state.processing_count < MAX_CONCURRENT:
-                st.session_state.processing_count += 1
-                # 在新线程中处理任务
+            if task.status == "QUEUED" and current_processing < MAX_CONCURRENT:
+                # 启动新任务
                 thread = threading.Thread(
                     target=process_single_task,
                     args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
                 )
                 thread.daemon = True
                 thread.start()
+                current_processing += 1
         
         # 显示所有任务
         for task in reversed(st.session_state.tasks):
@@ -394,7 +402,7 @@ with right_col:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
-    <p>💡 提示：支持同时处理最多3张图片，其余图片将在队列中等待</p>
+    <p>💡 提示：支持同时处理最多3张图片,其余图片将在队列中等待</p>
     <p>⏱️ 每张图片预计处理时间约2-3分钟</p>
 </div>
 """, unsafe_allow_html=True)
