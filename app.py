@@ -1,49 +1,94 @@
 import streamlit as st
 import requests
+import json
 import time
-from PIL import Image
 import io
+import os
+from PIL import Image
 from datetime import datetime
+import uuid
+import threading
+from queue import Queue
+import base64
 
 # 页面配置
 st.set_page_config(
-    page_title="RunningHub AI 图片优化",
+    page_title="RunningHub AI - 智能图片优化工具",
     page_icon="🎨",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # 自定义CSS样式
 st.markdown("""
 <style>
+    .main {
+        background-color: #f5f7fa;
+    }
     .stButton>button {
         width: 100%;
+        border-radius: 8px;
+        height: 3em;
         background-color: #3498db;
         color: white;
-        height: 3em;
-        border-radius: 8px;
         font-weight: bold;
     }
     .stButton>button:hover {
         background-color: #2980b9;
     }
-    .success-box {
-        padding: 1rem;
-        border-radius: 8px;
-        background-color: #d4edda;
-        border: 1px solid #c3e6cb;
+    .upload-box {
+        border: 2px dashed #3498db;
+        border-radius: 10px;
+        padding: 2rem;
+        text-align: center;
+        background-color: #e8f4f8;
         margin: 1rem 0;
     }
-    .info-box {
-        padding: 1rem;
-        border-radius: 8px;
-        background-color: #d1ecf1;
-        border: 1px solid #bee5eb;
+    .task-card {
+        background-color: white;
+        border-radius: 10px;
+        padding: 1.5rem;
         margin: 1rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .success-badge {
+        color: #27ae60;
+        font-weight: bold;
+    }
+    .error-badge {
+        color: #e74c3c;
+        font-weight: bold;
+    }
+    .processing-badge {
+        color: #f39c12;
+        font-weight: bold;
+    }
+    .info-badge {
+        color: #17a2b8;
+        font-weight: bold;
+    }
+    h1 {
+        color: #2c3e50;
+    }
+    h2, h3 {
+        color: #2c3e50;
+    }
+    .stProgress > div > div > div {
+        background-color: #3498db;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# API配置（预填好的）
+# 初始化 session_state
+if 'tasks' not in st.session_state:
+    st.session_state.tasks = []
+if 'processing_count' not in st.session_state:
+    st.session_state.processing_count = 0
+if 'task_counter' not in st.session_state:
+    st.session_state.task_counter = 0
+
+# 配置常量
+MAX_CONCURRENT = 3
 API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
@@ -52,221 +97,309 @@ NODE_INFO = [
     {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
 ]
 
-def upload_image(image_file):
-    """上传图片到服务器"""
-    url = 'https://www.runninghub.cn/task/openapi/upload'
-    
-    files = {'file': (image_file.name, image_file.getvalue())}
-    data = {'apiKey': API_KEY, 'fileType': 'image'}
-    
-    try:
-        response = requests.post(url, files=files, data=data, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        
-        if result.get("code") == 0:
-            return result['data']['fileName']
-        else:
-            st.error(f"上传失败: {result.get('msg', '未知错误')}")
-            return None
-    except Exception as e:
-        st.error(f"上传出错: {str(e)}")
-        return None
+class TaskItem:
+    """任务项类"""
+    def __init__(self, task_id, file_data, file_name):
+        self.task_id = task_id
+        self.file_data = file_data
+        self.file_name = file_name
+        self.status = "QUEUED"  # QUEUED, UPLOADING, PROCESSING, SUCCESS, FAILED
+        self.progress = 0
+        self.result_url = None
+        self.result_data = None
+        self.error_message = None
+        self.api_task_id = None
+        self.created_at = datetime.now()
+        self.start_time = None
+        self.elapsed_time = None
 
-def start_task(uploaded_filename):
-    """发起处理任务"""
-    url = 'https://www.runninghub.cn/task/openapi/run'
+def upload_file(file_data, file_name, api_key):
+    """上传文件到服务器"""
+    url = 'https://www.runninghub.cn/task/openapi/upload'
+    files = {'file': (file_name, file_data)}
+    data = {'apiKey': api_key, 'fileType': 'image'}
+    
+    response = requests.post(url, files=files, data=data, timeout=60)
+    response.raise_for_status()
+    
+    response_data = response.json()
+    if response_data.get("code") == 0:
+        return response_data['data']['fileName']
+    else:
+        raise Exception(f"图片上传失败: {response_data.get('msg', '未知错误')}")
+
+def run_task(api_key, webapp_id, node_info_list):
+    """发起任务"""
+    run_url = 'https://www.runninghub.cn/task/openapi/run'
     headers = {'Content-Type': 'application/json'}
-    
-    # 更新图片文件名
-    node_info_list = NODE_INFO.copy()
-    node_info_list[0]["fieldValue"] = uploaded_filename
-    
     payload = {
-        "apiKey": API_KEY,
-        "webappId": WEBAPP_ID,
+        "apiKey": api_key,
+        "webappId": webapp_id,
         "nodeInfoList": node_info_list
     }
     
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response = requests.post(run_url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    
+    run_data = response.json()
+    if run_data.get("code") != 0:
+        raise Exception(f"发起任务失败: {run_data.get('msg', '未知错误')}")
+    
+    return run_data['data']['taskId']
+
+def poll_task_status(api_key, task_id):
+    """轮询任务状态"""
+    status_url = 'https://www.runninghub.cn/task/openapi/status'
+    
+    while True:
+        response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=10)
         response.raise_for_status()
-        result = response.json()
+        data = response.json()
+        status = data.get('data')
         
-        if result.get("code") == 0:
-            return result['data']['taskId']
+        if status == "SUCCESS":
+            return "SUCCESS"
+        elif status == "FAILED":
+            raise Exception("任务处理失败")
+        elif status in ["QUEUED", "RUNNING"]:
+            time.sleep(3)  # 每3秒轮询一次
         else:
-            st.error(f"任务启动失败: {result.get('msg', '未知错误')}")
-            return None
-    except Exception as e:
-        st.error(f"启动任务出错: {str(e)}")
-        return None
+            raise Exception(f"未知状态: {status}")
 
-def check_task_status(task_id):
-    """检查任务状态"""
-    url = 'https://www.runninghub.cn/task/openapi/status'
+def fetch_task_output(api_key, task_id):
+    """获取任务输出"""
+    output_url = 'https://www.runninghub.cn/task/openapi/outputs'
+    response = requests.post(output_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
+    response.raise_for_status()
+    data = response.json()
     
-    try:
-        response = requests.post(url, json={'apiKey': API_KEY, 'taskId': task_id}, timeout=10)
-        response.raise_for_status()
-        result = response.json()
-        return result.get('data')
-    except Exception as e:
-        st.error(f"查询状态出错: {str(e)}")
-        return None
-
-def get_task_result(task_id):
-    """获取任务结果"""
-    url = 'https://www.runninghub.cn/task/openapi/outputs'
-    
-    try:
-        response = requests.post(url, json={'apiKey': API_KEY, 'taskId': task_id}, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-        
-        if result.get("code") == 0 and result.get("data"):
-            file_url = result["data"][0].get("fileUrl")
+    if data.get("code") == 0 and data.get("data"):
+        file_url = data["data"][0].get("fileUrl")
+        if file_url:
             return file_url
         else:
-            st.error("获取结果失败")
-            return None
-    except Exception as e:
-        st.error(f"获取结果出错: {str(e)}")
-        return None
+            raise Exception("未找到图片URL")
+    else:
+        raise Exception("获取结果失败")
 
-def download_image(image_url):
-    """下载处理后的图片"""
+def download_result_image(url):
+    """下载结果图片"""
+    response = requests.get(url, stream=True, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+def process_single_task(task, api_key, webapp_id, node_info):
+    """处理单个任务"""
     try:
-        response = requests.get(image_url, timeout=60)
-        response.raise_for_status()
-        return response.content
+        task.status = "UPLOADING"
+        task.start_time = time.time()
+        task.progress = 5
+        
+        # 上传文件
+        uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
+        task.progress = 15
+        
+        # 更新节点信息
+        node_info_list = node_info.copy()
+        for node in node_info_list:
+            if node["nodeId"] == "38":
+                node["fieldValue"] = uploaded_filename
+        
+        # 发起任务
+        task.api_task_id = run_task(api_key, webapp_id, node_info_list)
+        task.status = "PROCESSING"
+        task.progress = 20
+        
+        # 轮询状态
+        for progress in range(20, 96, 5):
+            task.progress = progress
+            time.sleep(2)
+            
+            # 检查状态
+            status_url = 'https://www.runninghub.cn/task/openapi/status'
+            response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task.api_task_id}, timeout=10)
+            data = response.json()
+            status = data.get('data')
+            
+            if status == "SUCCESS":
+                break
+            elif status == "FAILED":
+                raise Exception("任务处理失败")
+        
+        # 获取结果
+        task.progress = 95
+        result_url = fetch_task_output(api_key, task.api_task_id)
+        task.result_url = result_url
+        
+        # 下载结果
+        task.result_data = download_result_image(result_url)
+        task.progress = 100
+        task.status = "SUCCESS"
+        task.elapsed_time = time.time() - task.start_time
+        
     except Exception as e:
-        st.error(f"下载图片出错: {str(e)}")
-        return None
+        task.status = "FAILED"
+        task.error_message = str(e)
+        task.elapsed_time = time.time() - task.start_time if task.start_time else 0
+
+def get_image_download_link(img_data, filename):
+    """生成图片下载链接"""
+    b64 = base64.b64encode(img_data).decode()
+    href = f'<a href="data:image/png;base64,{b64}" download="{filename}">📥 下载优化后的图片</a>'
+    return href
 
 # 主界面
-st.title("🎨 RunningHub AI 智能图片优化工具")
-st.markdown("上传图片，AI自动优化处理，提升画质和细节")
+st.title("🎨 RunningHub AI - 智能图片优化工具")
+st.markdown("### 支持批量队列处理，最多同时处理3张图片")
 
-# 创建两列布局
-col1, col2 = st.columns([1, 1])
-
+# 统计信息
+col1, col2, col3, col4 = st.columns(4)
 with col1:
-    st.subheader("📤 上传原图")
-    uploaded_file = st.file_uploader(
-        "选择图片文件",
+    queued = sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
+    st.metric("队列中", queued)
+with col2:
+    processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
+    st.metric(f"处理中", f"{processing}/{MAX_CONCURRENT}")
+with col3:
+    completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
+    st.metric("已完成", completed)
+with col4:
+    failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
+    st.metric("失败", failed)
+
+st.markdown("---")
+
+# 左右分栏
+left_col, right_col = st.columns([2, 3])
+
+with left_col:
+    st.markdown("### 📁 图片上传")
+    
+    # 文件上传区域
+    uploaded_files = st.file_uploader(
+        "选择图片文件（支持多选）",
         type=['png', 'jpg', 'jpeg', 'webp'],
-        help="支持 PNG、JPG、JPEG、WEBP 格式"
+        accept_multiple_files=True,
+        help="可以一次选择多张图片进行批量处理"
     )
     
-    if uploaded_file:
-        # 显示原图
-        st.image(uploaded_file, caption="原始图片", use_container_width=True)
+    if uploaded_files:
+        st.success(f"已选择 {len(uploaded_files)} 个文件")
         
-        # 处理按钮
-        if st.button("🚀 开始AI处理", type="primary"):
-            with st.spinner("正在处理，请稍候..."):
-                # 步骤1: 上传图片
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                status_text.text("📤 正在上传图片...")
-                progress_bar.progress(10)
-                
-                uploaded_filename = upload_image(uploaded_file)
-                
-                if uploaded_filename:
-                    progress_bar.progress(20)
-                    
-                    # 步骤2: 启动任务
-                    status_text.text("⚡ 启动AI处理...")
-                    task_id = start_task(uploaded_filename)
-                    
-                    if task_id:
-                        progress_bar.progress(30)
-                        
-                        # 步骤3: 等待处理完成
-                        status_text.text("🤖 AI处理中，预计2-3分钟...")
-                        
-                        max_wait = 180  # 最多等3分钟
-                        start_time = time.time()
-                        check_interval = 3  # 每3秒检查一次
-                        
-                        while time.time() - start_time < max_wait:
-                            status = check_task_status(task_id)
-                            
-                            elapsed = int(time.time() - start_time)
-                            remaining = max(0, max_wait - elapsed)
-                            
-                            if status == "SUCCESS":
-                                progress_bar.progress(90)
-                                status_text.text("✅ 处理完成，正在获取结果...")
-                                
-                                # 获取结果
-                                result_url = get_task_result(task_id)
-                                if result_url:
-                                    progress_bar.progress(95)
-                                    status_text.text("📥 正在下载优化后的图片...")
-                                    
-                                    image_data = download_image(result_url)
-                                    if image_data:
-                                        progress_bar.progress(100)
-                                        status_text.empty()
-                                        progress_bar.empty()
-                                        
-                                        # 保存到session state
-                                        st.session_state.result_image = image_data
-                                        st.session_state.result_url = result_url
-                                        st.rerun()
-                                break
-                            
-                            elif status == "FAILED":
-                                st.error("❌ 处理失败，请重试")
-                                break
-                            
-                            elif status in ["QUEUED", "RUNNING"]:
-                                # 更新进度（30-85%之间）
-                                progress = 30 + int((elapsed / max_wait) * 55)
-                                progress_bar.progress(min(progress, 85))
-                                status_text.text(f"⚡ AI处理中... 剩余约{remaining//60}分{remaining%60}秒")
-                            
-                            time.sleep(check_interval)
-                        
-                        if time.time() - start_time >= max_wait:
-                            st.warning("⏱️ 处理超时，请稍后刷新页面查看结果")
-
-with col2:
-    st.subheader("✨ 优化结果")
-    
-    # 显示处理结果
-    if 'result_image' in st.session_state:
-        result_img = Image.open(io.BytesIO(st.session_state.result_image))
-        st.image(result_img, caption="AI优化后的图片", use_container_width=True)
-        
-        # 下载按钮
-        st.download_button(
-            label="💾 下载优化后的图片",
-            data=st.session_state.result_image,
-            file_name=f"optimized_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-            mime="image/png",
-            type="primary"
-        )
-        
-        # 清除按钮
-        if st.button("🔄 处理新图片"):
-            if 'result_image' in st.session_state:
-                del st.session_state.result_image
-            if 'result_url' in st.session_state:
-                del st.session_state.result_url
+        if st.button("🚀 添加到处理队列", type="primary"):
+            for uploaded_file in uploaded_files:
+                # 创建新任务
+                st.session_state.task_counter += 1
+                task = TaskItem(
+                    task_id=st.session_state.task_counter,
+                    file_data=uploaded_file.getvalue(),
+                    file_name=uploaded_file.name
+                )
+                st.session_state.tasks.append(task)
+            
+            st.success(f"已添加 {len(uploaded_files)} 个任务到队列！")
             st.rerun()
+    
+    st.markdown("---")
+    
+    # API配置信息（只读显示）
+    with st.expander("⚙️ API 配置信息", expanded=False):
+        st.text_input("API Key", value=API_KEY, disabled=True)
+        st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
+        st.markdown("**节点信息配置：**")
+        st.json(NODE_INFO)
+
+with right_col:
+    st.markdown("### 📊 任务队列")
+    
+    if not st.session_state.tasks:
+        st.info("暂无任务，请上传图片开始处理")
     else:
-        st.info("👈 请先上传图片并点击处理按钮")
+        # 处理队列中的任务
+        for task in st.session_state.tasks:
+            if task.status == "QUEUED" and st.session_state.processing_count < MAX_CONCURRENT:
+                st.session_state.processing_count += 1
+                # 在新线程中处理任务
+                thread = threading.Thread(
+                    target=process_single_task,
+                    args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
+                )
+                thread.daemon = True
+                thread.start()
+        
+        # 显示所有任务
+        for task in reversed(st.session_state.tasks):
+            with st.container():
+                st.markdown(f'<div class="task-card">', unsafe_allow_html=True)
+                
+                # 任务标题
+                col_title, col_status = st.columns([3, 1])
+                with col_title:
+                    st.markdown(f"**📄 {task.file_name}**")
+                with col_status:
+                    if task.status == "SUCCESS":
+                        st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
+                    elif task.status == "FAILED":
+                        st.markdown('<span class="error-badge">❌ 失败</span>', unsafe_allow_html=True)
+                    elif task.status in ["UPLOADING", "PROCESSING"]:
+                        st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
+                    else:
+                        st.markdown('<span class="info-badge">⏸️ 队列中</span>', unsafe_allow_html=True)
+                
+                # 进度条
+                if task.status in ["UPLOADING", "PROCESSING"]:
+                    st.progress(task.progress / 100)
+                    st.caption(f"进度: {task.progress}%")
+                    
+                    # 显示预估时间
+                    if task.start_time:
+                        elapsed = time.time() - task.start_time
+                        remaining = max(0, 150 - elapsed)
+                        minutes = int(remaining // 60)
+                        seconds = int(remaining % 60)
+                        st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
+                
+                # 结果显示
+                if task.status == "SUCCESS" and task.result_data:
+                    elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
+                    st.success(f"✅ 处理完成！用时: {elapsed_str}")
+                    
+                    # 显示图片
+                    img = Image.open(io.BytesIO(task.result_data))
+                    st.image(img, caption="优化后的图片", use_container_width=True)
+                    
+                    # 下载按钮
+                    download_filename = f"optimized_{task.file_name}"
+                    st.download_button(
+                        label="📥 下载优化后的图片",
+                        data=task.result_data,
+                        file_name=download_filename,
+                        mime="image/png",
+                        key=f"download_{task.task_id}"
+                    )
+                
+                elif task.status == "FAILED":
+                    st.error(f"❌ 处理失败: {task.error_message}")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown("---")
+        
+        # 清空按钮
+        if st.button("🗑️ 清空所有任务"):
+            st.session_state.tasks = []
+            st.session_state.processing_count = 0
+            st.rerun()
 
 # 页脚
 st.markdown("---")
 st.markdown("""
-<div style='text-align: center; color: #666; font-size: 0.9em;'>
-    <p>💡 提示：处理时间约2-3分钟，请耐心等待</p>
-    <p>🔒 您的图片会被安全处理，完成后自动删除</p>
+<div style='text-align: center; color: #7f8c8d;'>
+    <p>💡 提示：支持同时处理最多3张图片，其余图片将在队列中等待</p>
+    <p>⏱️ 每张图片预计处理时间约2-3分钟</p>
 </div>
 """, unsafe_allow_html=True)
+
+# 自动刷新处理中的任务
+if any(t.status in ["UPLOADING", "PROCESSING"] for t in st.session_state.tasks):
+    time.sleep(2)
+    st.rerun()
