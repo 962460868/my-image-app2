@@ -187,24 +187,52 @@ class RedisTokenManager:
         self.init_tokens()
     
     def init_tokens(self):
-        """初始化令牌桶"""
+        """初始化令牌桶（使用Redis锁防止并发初始化）"""
+        lock_key = f"{self.bucket_key}_init_lock"
+        lock_acquired = False
         try:
-            # 检查令牌桶是否已存在
-            current_tokens = self.redis_client.llen(self.bucket_key)
+            # 尝试获取一个10秒过期的锁，防止多个实例同时初始化
+            # nx=True 意味着 "SET if Not eXists" (SETNX)
+            # ex=10 意味着锁在10秒后自动过期，防止死锁
+            lock_acquired = self.redis_client.set(lock_key, "1", nx=True, ex=10)
             
-            if current_tokens == 0:
-                # 如果令牌桶为空，初始化令牌
-                for i in range(self.max_tokens):
-                    token_id = f"token_{i+1}_{int(time.time())}"
-                    self.redis_client.lpush(self.bucket_key, token_id)
-                st.success(f"✅ 已初始化 {self.max_tokens} 个全局处理令牌")
-                st.session_state.redis_connection_status = "initialized"
+            if lock_acquired:
+                # --- 我们成功获取了锁 ---
+                # 只有获取锁的这个实例可以执行初始化检查
+                
+                # 检查令牌桶是否已存在
+                current_tokens = self.redis_client.llen(self.bucket_key)
+                
+                if current_tokens == 0:
+                    # 如果令牌桶为空，初始化令牌
+                    for i in range(self.max_tokens):
+                        token_id = f"token_{i+1}_{int(time.time())}"
+                        self.redis_client.lpush(self.bucket_key, token_id)
+                    st.success(f"✅ 已初始化 {self.max_tokens} 个全局处理令牌")
+                    st.session_state.redis_connection_status = "initialized"
+                else:
+                    st.info(f"ℹ️ 发现现有令牌桶，当前可用令牌数：{current_tokens}")
+                    st.session_state.redis_connection_status = "connected"
+
             else:
-                st.info(f"ℹ️ 发现现有令牌桶，当前可用令牌数：{current_tokens}")
+                # --- 未获取到锁 ---
+                # 说明另一个实例正在初始化令牌桶
+                st.info(f"ℹ️ 另一个实例正在初始化令牌桶... 本实例将等待令牌。")
+                # 我们不需要做任何事，因为任务线程(process_single_task)
+                # 在调用 acquire_token() 时会使用 brpop 自动等待令牌被放入。
                 st.session_state.redis_connection_status = "connected"
+
         except Exception as e:
             st.error(f"❌ 初始化令牌桶失败：{str(e)}")
             st.session_state.redis_connection_status = "error"
+        finally:
+            # 为了严谨，如果获取了锁，可以在完成后立即删除它
+            # （但依赖10秒过期也是安全的）
+            if lock_acquired:
+                try:
+                    self.redis_client.delete(lock_key)
+                except Exception as e:
+                    logging.warning(f"释放初始化锁失败: {e}")
     
     def acquire_token(self, timeout=0):
         """获取令牌（阻塞操作）"""
