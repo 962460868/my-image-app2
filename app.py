@@ -143,6 +143,7 @@ def upload_file(file_data, file_name, api_key, task):
 
 def run_task(api_key, webapp_id, node_info_list, task):
     """发起任务"""
+    # 🔧 修复：使用正确的API端点
     run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
     headers = {'Content-Type': 'application/json'}
     payload = {
@@ -198,7 +199,7 @@ def fetch_task_output(api_key, task_id, task):
         else:
             raise Exception("未找到图片URL")
     else:
-        raise Exception("获取结果失败")
+        raise Exception(f"获取结果失败: {data.get('msg', '未知错误')}")
 
 def download_result_image(url, task):
     """下载结果图片"""
@@ -252,18 +253,32 @@ def process_single_task(task, api_key, webapp_id, node_info):
         task.status = "PROCESSING"
         task.progress = 20
         
-        # 步骤4: 轮询状态
+        # 步骤4: 轮询状态 - 🔧 修复轮询逻辑
         add_debug_log(task, "📍 步骤4: 轮询任务状态")
-        for progress in range(20, 96, 5):
-            task.progress = progress
-            time.sleep(2)
+        
+        progress = 20
+        max_polls = 60  # 最多轮询60次（约3分钟）
+        poll_count = 0
+        status = None
+        
+        while poll_count < max_polls:
+            time.sleep(3)  # 每3秒轮询一次
+            poll_count += 1
             
             status_url = 'https://www.runninghub.cn/task/openapi/status'
             response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task.api_task_id}, timeout=10)
+            response.raise_for_status()
             data = response.json()
             status = data.get('data')
             
-            add_debug_log(task, f"状态检查: {status} (进度: {progress}%)")
+            # 缓慢增长进度条：从20%到95%
+            if progress < 95:
+                progress += min(2, (95 - progress) / 10)  # 越接近95%增长越慢
+                progress = int(progress)
+            
+            task.progress = progress
+            
+            add_debug_log(task, f"状态检查 [{poll_count}/{max_polls}]: {status} (进度: {progress}%)")
             
             if status == "SUCCESS":
                 add_debug_log(task, "✅ 任务处理成功!")
@@ -271,24 +286,39 @@ def process_single_task(task, api_key, webapp_id, node_info):
             elif status == "FAILED":
                 add_debug_log(task, "❌ 任务处理失败!")
                 raise Exception("任务处理失败")
+            elif status in ["QUEUED", "RUNNING"]:
+                # 继续等待
+                continue
+            else:
+                add_debug_log(task, f"⚠️ 未知状态: {status}")
+                continue
         
-        # 步骤5: 获取结果
-        add_debug_log(task, "📍 步骤5: 获取处理结果")
-        task.progress = 95
-        result_url = fetch_task_output(api_key, task.api_task_id, task)
-        task.result_url = result_url
+        # 检查是否超时
+        if poll_count >= max_polls:
+            add_debug_log(task, f"❌ 轮询超时! 已轮询{max_polls}次")
+            raise Exception("任务处理超时")
         
-        # 步骤6: 下载结果
-        add_debug_log(task, "📍 步骤6: 下载结果图片")
-        task.result_data = download_result_image(result_url, task)
-        task.progress = 100
-        task.status = "SUCCESS"
-        task.elapsed_time = time.time() - task.start_time
-        
-        add_debug_log(task, "=" * 50)
-        add_debug_log(task, f"✅ 任务完成! 总耗时: {task.elapsed_time:.2f}秒")
-        add_debug_log(task, "=" * 50)
-        
+        # 只有在状态为SUCCESS时才获取结果
+        if status == "SUCCESS":
+            # 步骤5: 获取结果
+            add_debug_log(task, "📍 步骤5: 获取处理结果")
+            task.progress = 95
+            result_url = fetch_task_output(api_key, task.api_task_id, task)
+            task.result_url = result_url
+            
+            # 步骤6: 下载结果
+            add_debug_log(task, "📍 步骤6: 下载结果图片")
+            task.result_data = download_result_image(result_url, task)
+            task.progress = 100
+            task.status = "SUCCESS"
+            task.elapsed_time = time.time() - task.start_time
+            
+            add_debug_log(task, "=" * 50)
+            add_debug_log(task, f"✅ 任务完成! 总耗时: {task.elapsed_time:.2f}秒")
+            add_debug_log(task, "=" * 50)
+        else:
+            raise Exception(f"任务未成功完成，最终状态: {status}")
+            
     except Exception as e:
         task.status = "FAILED"
         task.error_message = str(e)
