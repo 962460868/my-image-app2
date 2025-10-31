@@ -170,11 +170,12 @@ CONCURRENT_LIMIT_ERRORS = [
     "concurrent limit",
     "too many requests", 
     "rate limit",
-    "队列已满",
+    "队列已满", # 增加了这个
     "并发限制",
     "服务忙碌",
     "CONCURRENT_LIMIT_EXCEEDED",
-    "TOO_MANY_REQUESTS"
+    "TOO_MANY_REQUESTS",
+    "TASK_QUEUE_MAXED" # 增加了这个
 ]
 
 class RedisTokenManager:
@@ -533,7 +534,11 @@ def download_result_image(url):
     return content
 
 def process_single_task(task, api_key, webapp_id, node_info, token_manager):
-    """处理单个任务（含令牌管理）"""
+    """
+    处理单个任务（含令牌管理和内部重试）
+    
+    *** 这是修改后的关键函数 ***
+    """
     token_id = None
     try:
         # 第一步：获取令牌（阻塞操作）
@@ -544,107 +549,136 @@ def process_single_task(task, api_key, webapp_id, node_info, token_manager):
         token_id = token_manager.acquire_token(timeout=300)
         
         if not token_id:
-            raise Exception("获取处理令牌超时，请稍后重试")
-        
+            # 5分钟都没拿到令牌，任务失败
+            task.status = "FAILED"
+            task.error_message = "获取处理令牌超时"
+            task.waiting_for_token = False
+            return # 退出线程
+
         task.token_id = token_id
         task.waiting_for_token = False
-        task.status = "UPLOADING"
+        task.status = "UPLOADING" # 初始状态
         task.start_time = time.time()
-        task.progress = 5
-        
-        # 步骤2: 上传文件
-        uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
-        task.progress = 15
-        
-        # 步骤3: 准备节点信息
-        node_info_list = copy.deepcopy(node_info)
-        
-        # 更新图片节点
-        for node in node_info_list:
-            if node["nodeId"] == "38":
-                node["fieldValue"] = uploaded_filename
-        
-        # 步骤4: 发起任务
-        task.api_task_id = run_task(api_key, webapp_id, node_info_list)
-        task.status = "PROCESSING"
-        task.progress = 20
-        
-        # 步骤5: 轮询状态
-        progress = 20
-        max_polls = 60  # 最多轮询60次（约3分钟）
-        poll_count = 0
-        status = None
-        
-        while poll_count < max_polls:
-            time.sleep(3)  # 每3秒轮询一次
-            poll_count += 1
-            
-            status_url = 'https://www.runninghub.cn/task/openapi/status'
-            response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task.api_task_id}, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            status = data.get('data')
-            
-            # 缓慢增长进度条：从20%到95%
-            if progress < 95:
-                progress += min(2, (95 - progress) / 10)  # 越接近95%增长越慢
-                progress = int(progress)
-            
-            task.progress = progress
-            
-            if status == "SUCCESS":
-                break
-            elif status == "FAILED":
-                raise Exception("任务处理失败")
-            elif status in ["QUEUED", "RUNNING"]:
-                # 继续等待
-                continue
-            else:
-                continue
-        
-        # 检查是否超时
-        if poll_count >= max_polls:
-            raise Exception("任务处理超时")
-        
-        # 只有在状态为SUCCESS时才获取结果
-        if status == "SUCCESS":
-            # 步骤6: 获取结果
-            task.progress = 95
-            result_url = fetch_task_output(api_key, task.api_task_id)
-            task.result_url = result_url
-            
-            # 步骤7: 下载结果
-            task.result_data = download_result_image(result_url)
-            task.progress = 100
-            task.status = "SUCCESS"
-            task.elapsed_time = time.time() - task.start_time
-        else:
-            raise Exception(f"任务未成功完成，最终状态: {status}")
+
+        # --- 关键改动：在这里循环重试，而不是在外面 ---
+        # 只要任务还拿着令牌，它就会一直重试直到成功或永久失败
+        while task.retry_count < task.max_retries:
+            try:
+                task.progress = 5
+                task.status = "UPLOADING" # 每次重试都从上传开始
+                
+                # 步骤2: 上传文件
+                uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
+                task.progress = 15
+                
+                # 步骤3: 准备节点信息
+                node_info_list = copy.deepcopy(node_info)
+                for node in node_info_list:
+                    if node["nodeId"] == "38":
+                        node["fieldValue"] = uploaded_filename
+                
+                # 步骤4: 发起任务
+                task.api_task_id = run_task(api_key, webapp_id, node_info_list)
+                task.status = "PROCESSING"
+                task.progress = 20
+                
+                # 步骤5: 轮询状态 (这部分逻辑不变)
+                progress = 20
+                max_polls = 60  # 约3分钟
+                poll_count = 0
+                status = None
+                
+                while poll_count < max_polls:
+                    time.sleep(3)
+                    poll_count += 1
+                    
+                    status_url = 'https://www.runninghub.cn/task/openapi/status'
+                    response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task.api_task_id}, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
+                    status = data.get('data')
+                    
+                    if progress < 95:
+                        progress += min(2, (95 - progress) / 10)
+                        progress = int(progress)
+                    task.progress = progress
+                    
+                    if status == "SUCCESS":
+                        break
+                    elif status == "FAILED":
+                        raise Exception("API任务处理失败 (FAILED status)")
+                    elif status in ["QUEUED", "RUNNING"]:
+                        continue
+                    else:
+                        continue
+                
+                if poll_count >= max_polls:
+                    raise Exception("任务处理超时 (Polling)")
+                
+                if status == "SUCCESS":
+                    task.progress = 95
+                    result_url = fetch_task_output(api_key, task.api_task_id)
+                    task.result_url = result_url
+                    
+                    task.result_data = download_result_image(result_url)
+                    task.progress = 100
+                    task.status = "SUCCESS"
+                    task.elapsed_time = time.time() - task.start_time
+                    
+                    # --- 成功，跳出重试循环 ---
+                    break 
+                
+                else:
+                    raise Exception(f"任务未成功完成，最终状态: {status}")
+
+            # --- 捕获内部循环的异常 ---
+            except Exception as e:
+                error_msg = str(e)
+                
+                # 检查是否是并发限制错误
+                if is_concurrent_limit_error(error_msg) and task.retry_count < task.max_retries:
+                    task.status = "WAITING"  # 新状态：等待重试
+                    task.retry_count += 1
+                    task.progress = 0
+                    # 随机等待2-10秒后重试
+                    wait_time = random.randint(2, 10)
+                    
+                    # (可选) 在UI上显示更清晰的等待信息
+                    task.error_message = f"API并发限制，第{task.retry_count}次重试..."
+                    
+                    time.sleep(wait_time)
+                    
+                    # --- 关键：使用 continue，再次尝试循环 ---
+                    # 此时 *没有* 释放令牌
+                    continue
+                
+                else:
+                    # --- 永久失败 ---
+                    # 其他错误或超过最大重试次数
+                    task.status = "FAILED"
+                    task.error_message = error_msg
+                    task.elapsed_time = time.time() - task.start_time if task.start_time else 0
+                    
+                    # --- 失败，跳出重试循环 ---
+                    break 
+
+        # --- 循环结束 ---
+        # 无论任务是 SUCCESS 还是 FAILED，它都结束了
+        # 现在可以释放令牌
             
     except Exception as e:
-        error_msg = str(e)
-        
-        # 检查是否是并发限制错误
-        if is_concurrent_limit_error(error_msg) and task.retry_count < task.max_retries:
-            # 并发限制错误，回到队列等待重试
-            task.status = "WAITING"  # 新状态：等待重试
-            task.retry_count += 1
-            task.progress = 0
-            # 随机等待2-10秒后重试，避免所有任务同时重试
-            wait_time = random.randint(2, 10)
-            time.sleep(wait_time)
-            task.status = "QUEUED"  # 重新排队
-        else:
-            # 其他错误或超过最大重试次数
-            task.status = "FAILED"
-            task.error_message = error_msg
-            task.elapsed_time = time.time() - task.start_time if task.start_time else 0
+        # 捕获最外层的异常 (例如 acquire_token 失败)
+        task.status = "FAILED"
+        task.error_message = f"严重错误: {str(e)}"
+    
     finally:
         # 确保释放令牌
+        # 只有当任务彻底结束（SUCCESS或FAILED）时，才会执行到这里
         if token_id:
             token_manager.release_token(token_id)
             task.token_id = None
         task.waiting_for_token = False
+
 
 # 初始化Redis连接和令牌管理器
 redis_client = get_redis_client()
@@ -708,7 +742,8 @@ with col2:
     waiting_token = sum(1 for t in st.session_state.tasks if t.status == "WAITING_TOKEN")
     st.metric("等待令牌", waiting_token)
 with col3:
-    processing_local = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
+    # 包含了UPLOADING, PROCESSING, WAITING (因为WAITING也持有令牌)
+    processing_local = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING", "WAITING"])
     st.metric(f"本地处理中", processing_local)
 with col4:
     st.metric(f"全局处理中", f"{processing_count}/{GLOBAL_CONCURRENT_LIMIT}")
@@ -850,6 +885,9 @@ with right_col:
         # 启动新任务的逻辑
         for task in st.session_state.tasks:
             if task.status == "QUEUED" and 'token_manager' in st.session_state:
+                # *** 关键：一旦任务进入 QUEUED 状态，就启动线程 ***
+                # 线程会自己处理 WAITING_TOKEN 状态
+                task.status = "STARTING" # 临时状态，防止重复启动线程
                 thread = threading.Thread(
                     target=process_single_task,
                     args=(task, API_KEY, WEBAPP_ID, NODE_INFO, st.session_state.token_manager)
@@ -880,7 +918,7 @@ with right_col:
                         st.markdown('<span class="token-waiting-badge">🎫 等待令牌</span>', unsafe_allow_html=True)
                     elif task.status == "WAITING":
                         st.markdown('<span class="waiting-badge">⏳ 等待重试</span>', unsafe_allow_html=True)
-                    else:
+                    else: # QUEUED 或 STARTING
                         st.markdown('<span class="info-badge">⏸️ 队列中</span>', unsafe_allow_html=True)
                 
                 # 进度条
@@ -897,7 +935,7 @@ with right_col:
                 elif task.status == "WAITING_TOKEN":
                     st.warning("🎫 正在等待获取全局处理令牌...")
                 elif task.status == "WAITING":
-                    st.info("API服务繁忙，正在等待重试...")
+                    st.info(f"API服务繁忙，正在等待第 {task.retry_count} 次重试...")
                 
                 # 结果显示 - 使用滑动对比
                 if task.status == "SUCCESS" and task.result_data:
@@ -944,6 +982,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # 自动刷新
-if any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "WAITING_TOKEN"] for t in st.session_state.tasks):
+# 检查是否有任务处于活动状态
+active_tasks = any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "WAITING_TOKEN", "STARTING"] for t in st.session_state.tasks)
+# 检查是否有任务在队列中等待启动
+queued_tasks = any(t.status == "QUEUED" for t in st.session_state.tasks)
+
+if active_tasks or queued_tasks:
     time.sleep(2)
     st.rerun()
