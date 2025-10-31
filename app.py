@@ -9,6 +9,7 @@ import random
 import redis
 import logging
 import pickle
+import streamlit.components.v1 as components
 
 # --- 1. 页面配置和全局设置 ---
 
@@ -38,13 +39,13 @@ NODE_INFO = [
     {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
 ]
 
-# 系统配置（优化性能）
+# 系统配置
 MAX_GLOBAL_CONCURRENT = 5  
 MAX_LOCAL_CONCURRENT = 3   
 MAX_RETRIES = 3            
 POLL_INTERVAL = 3          
 MAX_POLL_COUNT = 300       
-AUTO_REFRESH_INTERVAL = 8  # 增加到8秒，减少刷新频率
+AUTO_REFRESH_INTERVAL = 6  # 减少到6秒以提高响应性
 DISPLAY_TIMEOUT_MINUTES = 3  
 ACTUAL_TIMEOUT_MINUTES = 15  
 
@@ -59,7 +60,7 @@ CONCURRENT_LIMIT_ERRORS = [
     "队列已满", "并发限制", "服务忙碌", "CONCURRENT_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"
 ]
 
-# --- 2. 简化CSS样式 ---
+# --- 2. 优化CSS样式和JavaScript ---
 
 st.markdown("""
 <style>
@@ -67,9 +68,20 @@ st.markdown("""
     .stButton>button {
         width: 100%; border-radius: 6px; height: 2.5em;
         background-color: #0066cc; color: white; font-weight: 500;
-        transition: background-color 0.2s;
+        transition: all 0.2s ease;
     }
-    .stButton>button:hover { background-color: #0052a3; }
+    .stButton>button:hover { 
+        background-color: #0052a3; 
+        transform: translateY(-1px);
+    }
+    .stButton>button:active {
+        transform: translateY(0);
+        background-color: #004080;
+    }
+    .download-clicked {
+        background-color: #28a745 !important;
+        transform: scale(0.98);
+    }
     .task-card {
         background: white; border-radius: 8px; padding: 1rem; margin: 0.5rem 0;
         box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-left: 4px solid #0066cc;
@@ -83,12 +95,86 @@ st.markdown("""
         box-shadow: 0 1px 3px rgba(0,0,0,0.1); text-align: center; margin-bottom: 0.3rem;
     }
     .compact-info { font-size: 0.85em; color: #6c757d; margin: 0.2rem 0; }
+    .real-time { 
+        font-family: 'Courier New', monospace; 
+        color: #495057; 
+        font-weight: 500;
+        background-color: #f8f9fa;
+        padding: 2px 6px;
+        border-radius: 3px;
+    }
+    .download-feedback {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: #28a745;
+        color: white;
+        padding: 10px 20px;
+        border-radius: 5px;
+        z-index: 1000;
+        animation: slideIn 0.3s ease-out;
+    }
+    @keyframes slideIn {
+        from { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+    }
 </style>
+
+<script>
+// 实时时间更新
+function updateElapsedTimes() {
+    const timeElements = document.querySelectorAll('[data-start-time]');
+    timeElements.forEach(element => {
+        const startTime = parseFloat(element.getAttribute('data-start-time'));
+        const displayTimeout = parseInt(element.getAttribute('data-display-timeout')) * 60;
+        const now = Date.now() / 1000;
+        const elapsed = now - startTime;
+        
+        const elapsedMinutes = Math.floor(elapsed / 60);
+        const elapsedSeconds = Math.floor(elapsed % 60);
+        
+        let timeText = `⏱️ 已用时 ${elapsedMinutes}:${elapsedSeconds.toString().padStart(2, '0')}`;
+        
+        if (elapsed < displayTimeout) {
+            const remaining = Math.max(0, displayTimeout - elapsed);
+            const remainingMinutes = Math.floor(remaining / 60);
+            const remainingSeconds = Math.floor(remaining % 60);
+            timeText += ` | 预计剩余 ${remainingMinutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+        } else {
+            timeText += ' | 处理中...';
+        }
+        
+        element.innerHTML = timeText;
+    });
+}
+
+// 下载反馈
+function showDownloadFeedback() {
+    const feedback = document.createElement('div');
+    feedback.className = 'download-feedback';
+    feedback.textContent = '✅ 下载开始！';
+    document.body.appendChild(feedback);
+    
+    setTimeout(() => {
+        feedback.remove();
+    }, 2000);
+}
+
+// 页面加载完成后启动定时器
+document.addEventListener('DOMContentLoaded', function() {
+    setInterval(updateElapsedTimes, 1000); // 每秒更新
+});
+
+// 对于动态加载的内容，也要启动定时器
+setTimeout(() => {
+    setInterval(updateElapsedTimes, 1000);
+}, 1000);
+</script>
 """, unsafe_allow_html=True)
 
 # --- 3. Redis连接初始化（优化缓存） ---
 
-@st.cache_resource(ttl=300)  # 5分钟缓存
+@st.cache_resource(ttl=300)
 def init_redis_connection():
     """初始化Redis连接"""
     try:
@@ -105,7 +191,7 @@ def init_redis_connection():
 
 r, redis_error = init_redis_connection()
 
-# --- 4. 简化Session State管理 ---
+# --- 4. Session State管理 ---
 
 def get_session_key():
     if 'session_id' not in st.session_state:
@@ -125,9 +211,9 @@ def save_session_data():
             'task_counter': st.session_state.get('task_counter', 0),
             'timestamp': time.time()
         }
-        r.setex(session_key, 1800, pickle.dumps(session_data))  # 30分钟过期
+        r.setex(session_key, 1800, pickle.dumps(session_data))
     except:
-        pass  # 静默处理保存错误
+        pass
 
 # 初始化Session State
 if 'tasks' not in st.session_state:
@@ -138,6 +224,8 @@ if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
 if 'upload_success' not in st.session_state:
     st.session_state.upload_success = False
+if 'download_clicked' not in st.session_state:
+    st.session_state.download_clicked = {}
 
 # --- 5. 精简任务类 ---
 
@@ -163,7 +251,7 @@ class TaskItem:
             'created_at': self.created_at.isoformat(), 'retry_count': self.retry_count
         }
 
-# --- 6. 核心API函数（无变化但优化错误处理） ---
+# --- 6. 核心API函数 ---
 
 def is_concurrent_limit_error(error_msg):
     error_lower = error_msg.lower()
@@ -214,29 +302,25 @@ def download_result_image(url):
     response.raise_for_status()
     return response.content
 
-# --- 7. 优化任务处理逻辑 ---
+# --- 7. 任务处理逻辑 ---
 
 def process_single_task(task, api_key, webapp_id, node_info):
     task.status = "PROCESSING"
     task.start_time = time.time()
     
     try:
-        # 上传文件
         task.progress = 15
         uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
         
-        # 准备节点信息
         task.progress = 25
         node_info_list = copy.deepcopy(node_info)
         for node in node_info_list:
             if node["nodeId"] == "38":
                 node["fieldValue"] = uploaded_filename
         
-        # 发起任务
         task.progress = 35
         task.api_task_id = run_task(api_key, webapp_id, node_info_list)
         
-        # 轮询状态
         poll_count = 0
         while poll_count < MAX_POLL_COUNT:
             time.sleep(POLL_INTERVAL)
@@ -250,19 +334,16 @@ def process_single_task(task, api_key, webapp_id, node_info):
             elif status == "FAILED":
                 raise Exception("API任务处理失败")
             
-            # 每分钟保存一次
             if poll_count % 20 == 0:
                 save_session_data()
         
         if poll_count >= MAX_POLL_COUNT:
             raise Exception(f"任务超时 (>{ACTUAL_TIMEOUT_MINUTES}分钟)")
         
-        # 获取结果
         task.progress = 95
         result_url = fetch_task_output(api_key, task.api_task_id)
         task.result_data = download_result_image(result_url)
         
-        # 完成
         task.progress = 100
         task.status = "SUCCESS"
         task.elapsed_time = time.time() - task.start_time
@@ -283,7 +364,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
                 r.rpush(queue_key, task_data)
         else:
             task.status = "FAILED"
-            task.error_message = error_msg[:100]  # 限制错误信息长度
+            task.error_message = error_msg[:100]
             
         save_session_data()
     
@@ -292,9 +373,9 @@ def process_single_task(task, api_key, webapp_id, node_info):
             processing_key = GLOBAL_PROCESSING_SET.encode()
             r.srem(processing_key, str(task.task_id))
 
-# --- 8. 优化队列管理 ---
+# --- 8. 队列管理 ---
 
-@st.cache_data(ttl=2)  # 2秒缓存
+@st.cache_data(ttl=2)
 def get_queue_stats():
     if not r:
         return {'queued': 0, 'global_processing': 0, 'local_processing': 0}
@@ -352,13 +433,50 @@ def start_new_tasks():
                 r.rpush(queue_key, task_data_bytes)
                 
     except:
-        pass  # 静默处理启动错误
+        pass
 
-# --- 9. 优化主界面 ---
+# --- 9. 优化下载按钮组件 ---
+
+def create_download_button(task):
+    """创建优化的下载按钮"""
+    file_size = len(task.result_data) / 1024  # KB
+    button_key = f"download_{task.task_id}"
+    
+    # 检查是否刚刚点击过
+    clicked = st.session_state.download_clicked.get(task.task_id, False)
+    if clicked:
+        st.session_state.download_clicked[task.task_id] = False
+        
+        # 显示即时反馈
+        components.html("""
+        <script>
+            window.parent.postMessage({type: 'download_clicked'}, '*');
+            if (typeof showDownloadFeedback === 'function') {
+                showDownloadFeedback();
+            }
+        </script>
+        """, height=0)
+    
+    # 下载按钮
+    downloaded = st.download_button(
+        label=f"📥 下载结果 ({file_size:.1f}KB)",
+        data=task.result_data,
+        file_name=f"optimized_{task.file_name}",
+        mime="image/png",
+        key=button_key,
+        use_container_width=True,
+        help="点击立即下载优化后的图片"
+    )
+    
+    if downloaded:
+        st.session_state.download_clicked[task.task_id] = True
+        st.rerun()
+
+# --- 10. 主界面 ---
 
 def main():
     st.title("🎨 RunningHub AI - 智能图片优化工具")
-    st.caption("高效处理 • 快速响应 • 无图片预览版本")
+    st.caption("高效处理 • 快速响应 • 实时更新")
     
     st.info(f"⏱️ 预计处理时间: {DISPLAY_TIMEOUT_MINUTES}分钟 | 🔄 刷新间隔: {AUTO_REFRESH_INTERVAL}秒")
     st.divider()
@@ -415,7 +533,7 @@ def main():
         
         st.divider()
         
-        # 精简状态面板
+        # 状态面板
         with st.expander("📊 系统状态", expanded=True):
             stats = get_queue_stats()
             local_stats = {
@@ -424,7 +542,6 @@ def main():
                 'total': len(st.session_state.tasks)
             }
             
-            # 3x2网格布局
             c1, c2, c3 = st.columns(3)
             
             with c1:
@@ -439,7 +556,7 @@ def main():
                 st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#fd7e14">{stats["local_processing"]}/{MAX_LOCAL_CONCURRENT}</h4><p style="margin:0;font-size:11px">本页</p></div>', unsafe_allow_html=True)
                 st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#6c757d">{local_stats["total"]}</h4><p style="margin:0;font-size:11px">总数</p></div>', unsafe_allow_html=True)
         
-        # 精简系统信息
+        # 系统信息
         with st.expander("⚙️ 系统信息", expanded=False):
             st.text(f"Redis: {'✅连接' if r else '❌断开'}")
             st.text(f"会话: {get_session_key()}")
@@ -454,12 +571,12 @@ def main():
         else:
             start_new_tasks()
             
-            # 显示任务（最新在前，简化显示）
+            # 显示任务
             for task in reversed(st.session_state.tasks):
                 with st.container():
                     st.markdown('<div class="task-card">', unsafe_allow_html=True)
                     
-                    # 任务头部信息
+                    # 任务头部
                     col1, col2 = st.columns([4, 1])
                     
                     with col1:
@@ -477,36 +594,30 @@ def main():
                         else:
                             st.markdown('<span class="queued-badge">⏳ 队列中</span>', unsafe_allow_html=True)
                     
-                    # 进度和状态信息
+                    # 进度和实时时间显示
                     if task.status == "PROCESSING":
                         st.progress(task.progress / 100, text=f"进度: {int(task.progress)}%")
                         
                         if task.start_time:
-                            elapsed = time.time() - task.start_time
-                            display_timeout = DISPLAY_TIMEOUT_MINUTES * 60
-                            if elapsed < display_timeout:
-                                remaining = max(0, display_timeout - elapsed)
-                                st.markdown(f'<div class="compact-info">⏱️ 已用时 {int(elapsed//60)}:{int(elapsed%60):02d} | 预计剩余 {int(remaining//60)}:{int(remaining%60):02d}</div>', unsafe_allow_html=True)
-                            else:
-                                st.markdown(f'<div class="compact-info">⏱️ 已用时 {int(elapsed//60)}:{int(elapsed%60):02d} | 处理中...</div>', unsafe_allow_html=True)
+                            # 使用JavaScript实现实时时间更新
+                            st.markdown(f'''
+                            <div class="compact-info real-time" 
+                                 data-start-time="{task.start_time}" 
+                                 data-display-timeout="{DISPLAY_TIMEOUT_MINUTES}">
+                                ⏱️ 计算中...
+                            </div>
+                            ''', unsafe_allow_html=True)
                     
                     elif task.status == "QUEUED":
                         st.markdown('<div class="compact-info">⏳ 等待处理...</div>', unsafe_allow_html=True)
                     
-                    # 结果处理（无图片预览）
+                    # 结果处理
                     if task.status == "SUCCESS" and task.result_data:
                         elapsed_str = f"{int(task.elapsed_time//60)}:{int(task.elapsed_time%60):02d}"
                         st.success(f"🎉 处理完成! 用时: {elapsed_str}")
                         
-                        # 只显示下载按钮
-                        file_size = len(task.result_data) / 1024  # KB
-                        st.download_button(
-                            label=f"📥 下载结果 ({file_size:.1f}KB)",
-                            data=task.result_data,
-                            file_name=f"optimized_{task.file_name}",
-                            mime="image/png",
-                            use_container_width=True
-                        )
+                        # 使用优化的下载按钮
+                        create_download_button(task)
                     
                     elif task.status == "FAILED":
                         st.error(f"💥 处理失败")
@@ -523,6 +634,7 @@ def main():
             with col1:
                 if st.button("🗑️ 清空本页"):
                     st.session_state.tasks = []
+                    st.session_state.download_clicked = {}
                     save_session_data()
                     st.rerun()
             
@@ -531,6 +643,7 @@ def main():
                     try:
                         r.delete(GLOBAL_TASK_QUEUE.encode(), GLOBAL_PROCESSING_SET.encode())
                         st.session_state.tasks = []
+                        st.session_state.download_clicked = {}
                         save_session_data()
                         st.success("✅ 已清空")
                         st.rerun()
@@ -542,22 +655,22 @@ def main():
                     save_session_data()
                     st.success("✅ 已保存")
 
-    # 简化页脚
+    # 页脚
     st.divider()
     st.markdown("""
     <div style='text-align: center; color: #6c757d; padding: 15px;'>
-        <b>🚀 RunningHub AI - 高性能版</b><br>
-        <small>无图片预览 • 快速响应 • 专注处理效率</small>
+        <b>🚀 RunningHub AI - 实时响应版</b><br>
+        <small>快速下载 • 实时时间更新 • 即时反馈</small>
     </div>
     """, unsafe_allow_html=True)
 
-# --- 10. 优化应用入口 ---
+# --- 11. 应用入口 ---
 
 if __name__ == "__main__":
     try:
         main()
         
-        # 更智能的刷新逻辑
+        # 优化刷新逻辑
         has_active_tasks = any(t.status in ["PROCESSING", "QUEUED"] for t in st.session_state.tasks)
         
         if has_active_tasks:
