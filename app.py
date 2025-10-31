@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import time
 import io
-from PIL import Image
+from PIL import Image  # 确保 PIL (Pillow) 已安装
 from datetime import datetime
 import threading
 import base64
@@ -176,22 +176,55 @@ def update_task_from_redis_data(task: TaskItem, data: dict):
     task.status = "QUEUED" # 标记为已被调度器取出，正在排队等待线程启动
 
 
-# --- 3. 辅助函数 (图片对比组件优化) ---
+# --- 3. 辅助函数 (WebP 优化版本) ---
 
-# 修改：优化下载按钮的SVG图标，使其更像下载图标（向下箭头+底座）
+# <--- 关键修改：WebP 优化功能 ---
 def create_before_after_comparison(original_data, result_data, task_id):
-    """创建原图与结果图的滑动对比组件"""
-    # 将图片数据转换为base64
-    original_b64 = base64.b64encode(original_data).decode()
-    result_b64 = base64.b64encode(result_data).decode()
+    """
+    创建原图与结果图的滑动对比组件
+    (优化：使用WebP进行显示加速，但保留原始PNG/JPG用于下载)
+    """
+    
+    display_format = "webp"
+    download_format = "png" # 假设API返回的是PNG，与原代码下载逻辑一致
+    
+    # --- 1. 转换为 WebP (用于显示) ---
+    def to_webp_b64(img_bytes, quality=80):
+        """将原始图片字节转换为用于显示的WebP Base64"""
+        img = Image.open(io.BytesIO(img_bytes))
+        buffer = io.BytesIO()
+        # 使用较低质量(80)的WebP来最大化压缩，加快前端加载
+        img.save(buffer, format="WEBP", quality=quality)
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    try:
+        # 转换用于显示的图片 (display images)
+        original_b64_display = to_webp_b64(original_data, quality=80)
+        result_b64_display = to_webp_b64(result_data, quality=80)
+        
+    except Exception as e:
+        # Fallback: 如果WebP转换失败，则回退到使用原始编码 (速度会变慢)
+        st.warning(f"任务 {task_id} 的WebP转换失败 ({e})。将回退到PNG显示(可能较慢)。")
+        original_b64_display = base64.b64encode(original_data).decode()
+        result_b64_display = base64.b64encode(result_data).decode()
+        display_format = "png" # 回退到PNG格式
+
+    # --- 2. 准备原始结果 (用于下载) ---
+    # 下载按钮应提供API返回的、未经压缩的原始优化结果
+    # 我们需要原始结果的 Base64
+    result_b64_download = base64.b64encode(result_data).decode()
+
+    # --- 3. 生成 HTML ---
+    # (HTML 结构不变, 仅修改 `src` 和 `link.href`)
     
     html_code = f"""
     <div id="comparison-container-{task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
-        <img id="original-{task_id}" src="data:image/png;base64,{original_b64}" 
+        
+        <img id="original-{task_id}" src="data:image/{display_format};base64,{original_b64_display}" 
              style="width: 100%; height: auto; display: block;" alt="原图">
         
         <div id="result-overlay-{task_id}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden;">
-            <img id="result-{task_id}" src="data:image/png;base64,{result_b64}" 
+            <img id="result-{task_id}" src="data:image/{display_format};base64,{result_b64_display}" 
                  style="width: 100%; height: 100%; object-fit: cover;" alt="优化后">
         </div>
         
@@ -284,8 +317,12 @@ def create_before_after_comparison(original_data, result_data, task_id):
                 
                 // 创建下载链接
                 const link = document.createElement('a');
-                link.href = 'data:image/png;base64,{result_b64}';
-                link.download = 'optimized_{task_id}.png';
+                
+                // 优化：这里使用原始的、高质量的下载数据 (result_b64_download)
+                // 和 对应的下载格式 (download_format)
+                link.href = 'data:image/{download_format};base64,{result_b64_download}';
+                link.download = 'optimized_{task_id}.{download_format}';
+                
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
@@ -321,6 +358,8 @@ def create_before_after_comparison(original_data, result_data, task_id):
     """
     
     return html_code
+# <--- WebP 优化功能结束 ---
+
 
 def is_concurrent_limit_error(error_msg):
     """检查是否是并发限制错误"""
@@ -395,7 +434,7 @@ def download_result_image(url):
     return content
 
 
-# --- 4. 任务处理逻辑修改 (更新Redis Set) ---
+# --- 4. 任务处理逻辑修改 (移除 session_state 访问) ---
 
 def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, processing_set_key, global_queue_key):
     """
@@ -506,7 +545,7 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
         r.srem(processing_set_key, task_id_str)
 
 
-# --- 5. 主界面 ---
+# --- 5. 主界面 (增加主线程缓存逻辑) ---
 
 st.title("🎨 RunningHub AI - 智能图片优化工具 (分布式队列)")
 
@@ -697,6 +736,7 @@ with right_col:
                         try:
                             # 确保数据都存在 (task.result_data 是由子线程填充的)
                             if task.file_data and task.result_data:
+                                # 使用优化后的 create_before_after_comparison 函数
                                 st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
                             else:
                                 st.warning("任务数据不完整，无法生成对比图。")
@@ -741,7 +781,7 @@ st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
     <p>🚀 基于Redis实现分布式限流，**全局并发限制在5**，多机器提交任务自动排队</p>
     <p>📤 上传文件后，任务进入Redis全局队列，由任一空闲机器调度处理</p>
-    <p>🔍 **性能优化**：图片对比预览已缓存，避免重复加载导致卡顿</p>
+    <p>⚡️ **性能优化**：对比图使用 WebP 加速加载，同时保留高质量下载</p>
 </div>
 """, unsafe_allow_html=True)
 
