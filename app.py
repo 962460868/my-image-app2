@@ -143,7 +143,7 @@ def upload_file(file_data, file_name, api_key, task):
 
 def run_task(api_key, webapp_id, node_info_list, task):
     """发起任务"""
-    run_url = 'https://www.runninghub.cn/task/openapi/run'
+    run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
     headers = {'Content-Type': 'application/json'}
     payload = {
         "apiKey": api_key,
