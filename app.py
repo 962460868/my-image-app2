@@ -78,7 +78,7 @@ if 'file_uploader_key' not in st.session_state:
 
 # 配置常量
 MAX_LOCAL_CONCURRENT = 5  # 本地最大并发数
-API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"
+API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
     {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
@@ -143,12 +143,22 @@ def create_before_after_comparison(original_data, result_data, task_id):
             </div>
         </div>
         
-        <!-- 标签 -->
-        <div style="position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
+        <!-- 标签 - 修正位置 -->
+        <div style="position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
             原图
         </div>
-        <div style="position: absolute; top: 15px; right: 15px; background: rgba(52, 152, 219, 0.9); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
+        <div style="position: absolute; top: 15px; left: 15px; background: rgba(52, 152, 219, 0.9); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
             AI优化
+        </div>
+        
+        <!-- 下载按钮 -->
+        <div id="download-btn-{task_id}" style="position: absolute; bottom: 15px; right: 15px; width: 50px; height: 50px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.3); transition: all 0.3s ease;" 
+             onmouseover="this.style.background='rgba(52, 152, 219, 1)'; this.style.transform='scale(1.1)'"
+             onmouseout="this.style.background='rgba(52, 152, 219, 0.9)'; this.style.transform='scale(1)'">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="white">
+                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z" />
+                <path d="M12,11L16,15H13V19H11V15H8L12,11Z"/>
+            </svg>
         </div>
     </div>
 
@@ -157,6 +167,7 @@ def create_before_after_comparison(original_data, result_data, task_id):
         const container = document.getElementById('comparison-container-{task_id}');
         const divider = document.getElementById('divider-{task_id}');
         const resultOverlay = document.getElementById('result-overlay-{task_id}');
+        const downloadBtn = document.getElementById('download-btn-{task_id}');
         
         if (!container || !divider || !resultOverlay) return;
         
@@ -210,6 +221,28 @@ def create_before_after_comparison(original_data, result_data, task_id):
             document.removeEventListener('touchend', stopDrag);
         }}
         
+        // 下载功能
+        if (downloadBtn) {{
+            downloadBtn.addEventListener('click', function(e) {{
+                e.stopPropagation();
+                
+                // 创建下载链接
+                const link = document.createElement('a');
+                link.href = 'data:image/png;base64,{result_b64}';
+                link.download = 'optimized_image.png';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                // 显示下载提示
+                const originalText = downloadBtn.innerHTML;
+                downloadBtn.innerHTML = '<div style="color: white; font-size: 12px; font-weight: bold;">✓</div>';
+                setTimeout(() => {{
+                    downloadBtn.innerHTML = originalText;
+                }}, 1000);
+            }});
+        }}
+        
         // 初始化为显示结果图（70%）
         updateComparison(70);
         
@@ -219,7 +252,7 @@ def create_before_after_comparison(original_data, result_data, task_id):
         
         // 点击容器其他位置也可以调整
         container.addEventListener('click', function(e) {{
-            if (e.target === divider || divider.contains(e.target)) return;
+            if (e.target === divider || divider.contains(e.target) || e.target === downloadBtn || downloadBtn.contains(e.target)) return;
             
             const rect = container.getBoundingClientRect();
             const clickX = e.clientX - rect.left;
@@ -533,21 +566,12 @@ with right_col:
                     st.success(f"✅ 处理完成！用时: {elapsed_str}")
                     
                     # 显示滑动对比组件
-                    st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比）")
+                    st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
                     comparison_html = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
                     components.html(comparison_html, height=600)
                     
                     # 使用说明
-                    st.caption("💡 左侧显示原图，右侧显示AI优化后的效果。拖动中间线或点击图片任意位置进行对比。")
-                    
-                    download_filename = f"optimized_{task.file_name}"
-                    st.download_button(
-                        label="📥 下载优化后的图片",
-                        data=task.result_data,
-                        file_name=download_filename,
-                        mime="image/png",
-                        key=f"download_{task.task_id}"
-                    )
+                    st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
                 
                 elif task.status == "FAILED":
                     st.error(f"❌ 处理失败: {task.error_message}")
@@ -568,7 +592,7 @@ st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
     <p>🚀 支持最多5个本地并发任务，API繁忙时自动排队等待</p>
     <p>📤 上传文件后自动加入处理队列，智能重试机制确保成功率</p>
-    <p>🔍 完成后支持原图与AI优化图片的滑动对比预览</p>
+    <p>🔍 完成后支持原图与AI优化图片的滑动对比预览，点击图片右下角图标直接下载</p>
 </div>
 """, unsafe_allow_html=True)
 
