@@ -89,7 +89,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Redis配置 - 针对Redis Cloud优化
+# Redis配置 - 使用Redis Cloud推荐方式
 def get_redis_config():
     """从Streamlit secrets或环境变量获取Redis配置"""
     try:
@@ -101,23 +101,19 @@ def get_redis_config():
                 return {
                     'host': parsed.hostname,
                     'port': parsed.port or 6379,
+                    'username': parsed.username or 'default',
                     'password': parsed.password,
                     'db': int(parsed.path.lstrip('/')) if parsed.path and parsed.path != '/' else 0,
-                    'ssl': True,
-                    'ssl_cert_reqs': None,
-                    'ssl_check_hostname': False,
-                    'ssl_ca_certs': None
+                    'decode_responses': False
                 }
             elif "REDIS_HOST" in st.secrets:
                 return {
                     'host': st.secrets["REDIS_HOST"],
                     'port': int(st.secrets["REDIS_PORT"]),
+                    'username': st.secrets.get("REDIS_USERNAME", "default"),
                     'password': st.secrets["REDIS_PASSWORD"],
                     'db': int(st.secrets.get("REDIS_DB", 0)),
-                    'ssl': True,
-                    'ssl_cert_reqs': None,
-                    'ssl_check_hostname': False,
-                    'ssl_ca_certs': None
+                    'decode_responses': False
                 }
     except Exception as e:
         st.warning(f"读取Streamlit secrets时出错: {e}")
@@ -129,24 +125,20 @@ def get_redis_config():
         return {
             'host': parsed.hostname,
             'port': parsed.port or 6379,
+            'username': parsed.username or 'default',
             'password': parsed.password,
             'db': int(parsed.path.lstrip('/')) if parsed.path and parsed.path != '/' else 0,
-            'ssl': True,
-            'ssl_cert_reqs': None,
-            'ssl_check_hostname': False,
-            'ssl_ca_certs': None
+            'decode_responses': False
         }
     
-    # 默认配置 - 使用你的Redis Cloud信息
+    # 默认配置 - 使用Redis Cloud信息
     return {
         'host': os.getenv('REDIS_HOST', 'redis-18743.c340.ap-northeast-2-1.ec2.redns.redis-cloud.com'),
         'port': int(os.getenv('REDIS_PORT', 18743)),
+        'username': os.getenv('REDIS_USERNAME', 'default'),
         'password': os.getenv('REDIS_PASSWORD', 'dBAPubXYReEwHaIvnvX0lvr3qIgtudCp'),
         'db': int(os.getenv('REDIS_DB', 0)),
-        'ssl': True,
-        'ssl_cert_reqs': None,
-        'ssl_check_hostname': False,
-        'ssl_ca_certs': None
+        'decode_responses': False
     }
 
 # 获取Redis配置
@@ -223,7 +215,7 @@ class RedisTokenManager:
                 result = self.redis_client.brpop(self.bucket_key, timeout=0)
             
             if result:
-                return result[1].decode('utf-8')
+                return result[1].decode('utf-8') if isinstance(result[1], bytes) else result[1]
             return None
         except Exception as e:
             logging.error(f"获取令牌失败：{str(e)}")
@@ -253,46 +245,50 @@ class RedisTokenManager:
 def get_redis_client():
     """获取Redis连接（使用Streamlit缓存）"""
     try:
+        # 使用Redis Cloud推荐的连接方式
         client = redis.Redis(
             host=REDIS_CONFIG['host'],
             port=REDIS_CONFIG['port'],
+            username=REDIS_CONFIG.get('username', 'default'),
             password=REDIS_CONFIG['password'],
-            db=REDIS_CONFIG['db'],
-            ssl=REDIS_CONFIG.get('ssl', True),
-            ssl_cert_reqs=REDIS_CONFIG.get('ssl_cert_reqs'),
-            ssl_check_hostname=REDIS_CONFIG.get('ssl_check_hostname', False),
-            ssl_ca_certs=REDIS_CONFIG.get('ssl_ca_certs'),
-            decode_responses=False,  # 手动处理编码
+            db=REDIS_CONFIG.get('db', 0),
+            decode_responses=REDIS_CONFIG.get('decode_responses', False),
             socket_timeout=15,
             socket_connect_timeout=15,
             retry_on_timeout=True,
-            retry_on_error=[redis.ConnectionError, redis.TimeoutError],
             health_check_interval=30
         )
         
         # 测试连接
-        client.ping()
+        result = client.ping()
+        if result:
+            st.session_state.redis_connection_test = "success"
         
         # 获取Redis服务器信息
         info = client.info()
         st.session_state.redis_info = {
             'redis_version': info.get('redis_version', 'Unknown'),
             'used_memory_human': info.get('used_memory_human', 'Unknown'),
-            'connected_clients': info.get('connected_clients', 0)
+            'connected_clients': info.get('connected_clients', 0),
+            'uptime_in_days': info.get('uptime_in_days', 0)
         }
         
         return client
+        
     except redis.ConnectionError as e:
         st.error(f"❌ Redis连接错误：{str(e)}")
         st.error("请检查Redis Cloud服务状态和网络连接")
+        st.session_state.redis_connection_test = "connection_error"
         return None
     except redis.AuthenticationError as e:
         st.error(f"❌ Redis认证失败：{str(e)}")
-        st.error("请检查Redis密码是否正确")
+        st.error("请检查Redis用户名和密码是否正确")
+        st.session_state.redis_connection_test = "auth_error"
         return None
     except Exception as e:
         st.error(f"❌ Redis连接失败：{str(e)}")
         st.error(f"配置信息: {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
+        st.session_state.redis_connection_test = "unknown_error"
         return None
 
 class TaskItem:
@@ -645,7 +641,7 @@ if redis_client:
     with col_status2:
         if 'redis_info' in st.session_state:
             info = st.session_state.redis_info
-            st.info(f"🖥️ Redis版本: {info['redis_version']} | 内存使用: {info['used_memory_human']}")
+            st.info(f"🖥️ Redis {info['redis_version']} | 运行 {info['uptime_in_days']}天 | 内存: {info['used_memory_human']}")
     
     # 获取令牌状态
     if 'token_manager' in st.session_state:
@@ -660,12 +656,19 @@ else:
     
     # 显示配置信息用于调试
     with st.expander("🔧 配置调试信息", expanded=True):
-        st.json({
-            "host": REDIS_CONFIG['host'],
-            "port": REDIS_CONFIG['port'],
-            "ssl": REDIS_CONFIG.get('ssl', False),
-            "password_length": len(REDIS_CONFIG['password']) if REDIS_CONFIG['password'] else 0
-        })
+        debug_config = REDIS_CONFIG.copy()
+        debug_config['password'] = f"*****{debug_config['password'][-4:]}" if debug_config['password'] else None
+        st.json(debug_config)
+        
+        # 显示连接测试结果
+        if 'redis_connection_test' in st.session_state:
+            test_result = st.session_state.redis_connection_test
+            if test_result == "auth_error":
+                st.error("🔐 认证失败 - 请检查用户名和密码")
+            elif test_result == "connection_error":
+                st.error("🌐 连接失败 - 请检查主机地址和端口")
+            elif test_result == "unknown_error":
+                st.error("❓ 未知错误 - 请检查所有配置")
     st.stop()
 
 # 统计信息
@@ -745,7 +748,7 @@ with left_col:
         **Redis Cloud 状态**:
         - 🖥️ 主机: `{REDIS_CONFIG['host']}`
         - 🔌 端口: `{REDIS_CONFIG['port']}`
-        - 🔐 SSL加密: ✅
+        - 👤 用户: `{REDIS_CONFIG.get('username', 'default')}`
         - 🎫 令牌桶: `{TOKEN_BUCKET_KEY}`
         - 🔄 全局并发限制: `{GLOBAL_CONCURRENT_LIMIT}`
         
@@ -763,17 +766,29 @@ with left_col:
             if st.button("🔍 测试Redis连接"):
                 try:
                     if redis_client:
-                        redis_client.ping()
-                        st.success("✅ Redis连接测试成功!")
-                        
-                        # 显示详细信息
-                        info = redis_client.info()
-                        st.json({
-                            "服务器版本": info.get('redis_version'),
-                            "运行时间": f"{info.get('uptime_in_days', 0)}天",
-                            "内存使用": info.get('used_memory_human'),
-                            "连接客户端": info.get('connected_clients')
-                        })
+                        # 基础连接测试
+                        result = redis_client.ping()
+                        if result:
+                            st.success("✅ 基础连接测试成功!")
+                            
+                            # 读写测试
+                            test_key = f"test_key_{int(time.time())}"
+                            redis_client.set(test_key, "test_value")
+                            value = redis_client.get(test_key)
+                            redis_client.delete(test_key)
+                            
+                            if value:
+                                st.success("✅ 读写测试成功!")
+                            
+                            # 显示详细信息
+                            if 'redis_info' in st.session_state:
+                                info = st.session_state.redis_info
+                                st.json({
+                                    "服务器版本": info['redis_version'],
+                                    "运行时间": f"{info['uptime_in_days']}天",
+                                    "内存使用": info['used_memory_human'],
+                                    "连接客户端": info['connected_clients']
+                                })
                     else:
                         st.error("❌ Redis客户端未初始化")
                 except Exception as e:
@@ -790,9 +805,9 @@ with left_col:
                         
                         # 显示令牌详情
                         if available > 0:
-                            st.write("令牌桶状态正常")
+                            st.write("✅ 令牌桶状态正常")
                         else:
-                            st.warning("所有令牌都在使用中")
+                            st.warning("⚠️ 所有令牌都在使用中")
                     except Exception as e:
                         st.error(f"❌ 检查失败: {str(e)}")
                 else:
