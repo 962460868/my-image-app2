@@ -44,13 +44,14 @@ NODE_INFO = [
 ]
 
 # 系统配置（修复超时和刷新问题）
-MAX_GLOBAL_CONCURRENT = 5   # API总并发限制
-MAX_LOCAL_CONCURRENT = 3    # 单个网页并发限制
-MAX_RETRIES = 3             # 最大重试次数
-POLL_INTERVAL = 3           # 轮询间隔
-MAX_POLL_COUNT = 300        # 最大轮询次数 (300*3秒=15分钟)
-AUTO_REFRESH_INTERVAL = 5   # 增加自动刷新间隔，减少刷新频率
-DISPLAY_ESTIMATE_SECONDS = 180  # UI显示预计3分钟倒计时，真实容错仍15分钟
+MAX_GLOBAL_CONCURRENT = 5  # API总并发限制
+MAX_LOCAL_CONCURRENT = 3   # 单个网页并发限制
+MAX_RETRIES = 3            # 最大重试次数
+POLL_INTERVAL = 3          # 轮询间隔
+MAX_POLL_COUNT = 300       # 最大轮询次数 (300*3秒=15分钟)
+AUTO_REFRESH_INTERVAL = 5  # 增加自动刷新间隔，减少刷新频率
+DISPLAY_TIMEOUT_MINUTES = 3  # 显示的预计时间（分钟）
+ACTUAL_TIMEOUT_MINUTES = 15  # 实际超时时间（分钟）
 
 # Redis键名
 GLOBAL_TASK_QUEUE = "runninghub:task_queue"
@@ -63,20 +64,33 @@ CONCURRENT_LIMIT_ERRORS = [
     "队列已满", "并发限制", "服务忙碌", "CONCURRENT_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"
 ]
 
-# --- 2. 自定义CSS样式（强化对比区，固定高度500px，杜绝闪烁） ---
+# --- 2. 自定义CSS样式 ---
 
 st.markdown("""
 <style>
-    .main { background-color: #f5f7fa; }
+    .main {
+        background-color: #f5f7fa;
+    }
     .stButton>button {
-        width: 100%; border-radius: 8px; height: 3em;
-        background-color: #3498db; color: white; font-weight: bold;
+        width: 100%;
+        border-radius: 8px;
+        height: 3em;
+        background-color: #3498db;
+        color: white;
+        font-weight: bold;
         transition: all 0.3s ease;
     }
-    .stButton>button:hover { background-color: #2980b9; transform: translateY(-1px); }
+    .stButton>button:hover {
+        background-color: #2980b9;
+        transform: translateY(-1px);
+    }
     .task-card {
-        background-color: white; border-radius: 10px; padding: 1.5rem; margin: 1rem 0;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1); border: 1px solid #e1e8ed;
+        background-color: white;
+        border-radius: 10px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        border: 1px solid #e1e8ed;
     }
     .success-badge { color: #27ae60; font-weight: bold; }
     .error-badge { color: #e74c3c; font-weight: bold; }
@@ -84,44 +98,34 @@ st.markdown("""
     .info-badge { color: #17a2b8; font-weight: bold; }
     .waiting-badge { color: #9b59b6; font-weight: bold; }
     .metric-container {
-        background: white; padding: 1rem; border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05); text-align: center; border: 1px solid #e1e8ed;
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        text-align: center;
+        border: 1px solid #e1e8ed;
+        margin-bottom: 0.5rem;
     }
-    .local-processing { color: #e67e22; font-weight: bold; }
-    .global-processing { color: #8e44ad; font-weight: bold; }
-
-    /* 对比容器与图片（修复闪烁 + 预留500px高度） */
-    .comparison-container {
-        position: relative; width: 100%; height: 500px;
-        background: #111; border-radius: 10px; overflow: hidden;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    .local-processing {
+        color: #e67e22;
+        font-weight: bold;
     }
-    .comparison-image {
-        width: 100%; height: 100%; object-fit: contain;
-        image-rendering: auto !important;
-        transition: none !important;
-        backface-visibility: hidden; -webkit-backface-visibility: hidden;
-        transform: translateZ(0);
-        display: block;
+    .global-processing {
+        color: #8e44ad;
+        font-weight: bold;
     }
-    .comparison-divider {
-        position: absolute; top: 0; width: 3px; height: 100%;
-        background: #3498db; cursor: ew-resize; z-index: 10; left: 70%; margin-left: -1.5px;
-        box-shadow: 0 0 8px rgba(52,152,219,0.5);
+    .download-btn {
+        display: inline-block;
+        padding: 8px 16px;
+        background-color: #3498db;
+        color: white;
+        text-decoration: none;
+        border-radius: 5px;
+        margin: 10px 0;
+        transition: background-color 0.3s;
     }
-    .comparison-badge {
-        position: absolute; top: 10px; z-index: 12; color: #fff;
-        padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;
-    }
-    .badge-left { left: 10px; background: rgba(52, 152, 219, 0.9); }
-    .badge-right { right: 10px; background: rgba(0,0,0,0.6); }
-
-    /* 处理中遮罩（保留稳定高度，避免白屏） */
-    .processing-mask {
-        position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-        background: linear-gradient(90deg, rgba(0,0,0,0.2), rgba(0,0,0,0.35));
-        color: #fff; font-weight: 600; z-index: 15;
-        backdrop-filter: blur(1px);
+    .download-btn:hover {
+        background-color: #2980b9;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -221,9 +225,6 @@ if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
-# 图片缓存，解决显示闪烁问题
-if 'image_cache' not in st.session_state:
-    st.session_state.image_cache = {}
 
 # --- 5. 任务类定义（增加缓存支持） ---
 
@@ -238,26 +239,11 @@ class TaskItem:
         self.progress = 0
         self.result_data = None
         self.error_message = None
-               self.api_task_id = None
+        self.api_task_id = None
         self.created_at = datetime.now()
         self.start_time = None
         self.elapsed_time = None
         self.retry_count = 0
-        # 缓存相关
-        self._original_b64 = None
-        self._result_b64 = None
-
-    def get_original_b64(self):
-        """获取原图Base64（缓存）"""
-        if self._original_b64 is None and self.file_data:
-            self._original_b64 = base64.b64encode(self.file_data).decode()
-        return self._original_b64
-
-    def get_result_b64(self):
-        """获取结果图Base64（缓存）"""
-        if self._result_b64 is None and self.result_data:
-            self._result_b64 = base64.b64encode(self.result_data).decode()
-        return self._result_b64
 
     def to_dict(self):
         """序列化为字典"""
@@ -269,104 +255,7 @@ class TaskItem:
             'retry_count': self.retry_count
         }
 
-# --- 6. 图片对比组件（占位+最终态，固定高度500px，不闪烁） ---
-
-def build_comparison_html(task, result_b64=None):
-    original_b64 = task.get_original_b64()
-    if not original_b64:
-        return None
-
-    # 如果结果还没好，用原图暂代，叠加“生成中”遮罩
-    use_result_b64 = result_b64 if result_b64 else original_b64
-    show_mask = (result_b64 is None)
-
-    return f"""
-    <div id="comparison-container-{task.task_id}" class="comparison-container">
-        <img class="comparison-image" id="original-{task.task_id}"
-             src="data:image/png;base64,{original_b64}" alt="原图"/>
-
-        <div id="result-overlay-{task.task_id}" style="position:absolute;top:0;left:0;width:70%;height:100%;overflow:hidden;">
-            <img class="comparison-image" src="data:image/png;base64,{use_result_b64}" alt="AI优化"/>
-        </div>
-
-        <div id="divider-{task.task_id}" class="comparison-divider">
-            <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
-                        width:32px;height:32px;background:#3498db;border-radius:50%;
-                        display:flex;align-items:center;justify-content:center;
-                        box-shadow:0 2px 6px rgba(0,0,0,0.2); border:2px solid white;">
-                <span style="color:white;font-size:12px;font-weight:bold;">⟷</span>
-            </div>
-        </div>
-
-        <div class="comparison-badge badge-left">{'AI优化' + ('（生成中）' if show_mask else '')}</div>
-        <div class="comparison-badge badge-right">原图</div>
-
-        {'<div class="processing-mask">正在生成优化效果，请稍候…</div>' if show_mask else ''}
-
-        <div id="download-btn-{task.task_id}" style="position:absolute;bottom:10px;right:10px;width:40px;height:40px;
-             background: rgba(52,152,219,0.9); border-radius:50%; display:flex;align-items:center;justify-content:center;
-             cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,0.3); transition:all .3s ease; z-index: 14;"
-             onmouseover="this.style.background='rgba(52,152,219,1)'; this.style.transform='scale(1.1)'"
-             onmouseout="this.style.background='rgba(52,152,219,0.9)'; this.style.transform='scale(1)'">
-            <span style="color:white;font-size:18px;">⬇</span>
-        </div>
-    </div>
-
-    <script>
-    (function(){{
-        const container = document.getElementById('comparison-container-{task.task_id}');
-        const divider = document.getElementById('divider-{task.task_id}');
-        const resultOverlay = document.getElementById('result-overlay-{task.task_id}');
-        const downloadBtn = document.getElementById('download-btn-{task.task_id}');
-        if (!container || !divider || !resultOverlay) return;
-
-        function updateComparison(pct){{
-            pct = Math.max(10, Math.min(90, pct));
-            divider.style.left = pct + '%';
-            resultOverlay.style.width = pct + '%';
-        }}
-        function handle(e){{
-            const rect = container.getBoundingClientRect();
-            const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
-            updateComparison((x/rect.width)*100);
-        }}
-        divider.addEventListener('mousedown', (e)=>{{
-            const move=(ev)=>handle(ev);
-            const up=()=>{{document.removeEventListener('mousemove',move);document.removeEventListener('mouseup',up);}};
-            document.addEventListener('mousemove',move); document.addEventListener('mouseup',up); e.preventDefault();
-        }});
-        container.addEventListener('click', function(e){{
-            if (e.target===downloadBtn || downloadBtn.contains(e.target)) return;
-            handle(e);
-        }});
-        downloadBtn.addEventListener('click', function(e){{
-            e.stopPropagation();
-            const link = document.createElement('a');
-            link.href = 'data:image/png;base64,{use_result_b64}';
-            link.download = 'optimized_{task.file_name}';
-            document.body.appendChild(link); link.click(); document.body.removeChild(link);
-            const o = this.innerHTML; this.innerHTML = '<span style="color:#fff;font-size:16px;">✓</span>';
-            setTimeout(()=>{{ this.innerHTML=o; }}, 1500);
-        }});
-        updateComparison(70);
-    }})();
-    </script>
-    """
-
-def create_image_comparison_cached(task):
-    # 结果已就绪时缓存最终HTML，避免二次计算；未就绪直接返回占位HTML（不缓存）
-    result_b64 = task.get_result_b64()
-    cache_key = f"comparison_{task.task_id}_final"
-    if result_b64:
-        if cache_key in st.session_state.image_cache:
-            return st.session_state.image_cache[cache_key]
-        html = build_comparison_html(task, result_b64=result_b64)
-        st.session_state.image_cache[cache_key] = html
-        return html
-    else:
-        return build_comparison_html(task, result_b64=None)
-
-# --- 7. 核心API函数 ---
+# --- 6. 核心API函数 ---
 
 def is_concurrent_limit_error(error_msg):
     """检查是否是并发限制错误"""
@@ -384,7 +273,7 @@ def upload_file(file_data, file_name, api_key):
     result = response.json()
     
     if result.get("code") == 0:
-        return result['data']['fileName']
+        return result['data'] ['fileName']
     else:
         raise Exception(f"文件上传失败: {result.get('msg', '未知错误')}")
 
@@ -405,7 +294,7 @@ def run_task(api_key, webapp_id, node_info_list):
     if result.get("code") != 0:
         raise Exception(f"任务发起失败: {result.get('msg', '未知错误')}")
     
-    return result['data']['taskId']
+    return result['data'] ['taskId']
 
 def get_task_status(api_key, task_id):
     """获取任务状态"""
@@ -422,7 +311,7 @@ def fetch_task_output(api_key, task_id):
     data = response.json()
     
     if data.get("code") == 0 and data.get("data"):
-        file_url = data["data"][0].get("fileUrl")
+        file_url = data["data"] [0].get("fileUrl")
         if file_url:
             return file_url
     
@@ -434,10 +323,10 @@ def download_result_image(url):
     response.raise_for_status()
     return response.content
 
-# --- 8. 任务处理核心逻辑（修复超时问题） ---
+# --- 7. 任务处理核心逻辑（修复时间显示） ---
 
 def process_single_task(task, api_key, webapp_id, node_info):
-    """处理单个任务（修复超时到15分钟）"""
+    """处理单个任务（实际15分钟超时，但显示3分钟预计时间）"""
     task.status = "PROCESSING"
     task.start_time = time.time()
     
@@ -457,7 +346,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
         task.progress = 30
         task.api_task_id = run_task(api_key, webapp_id, node_info_list)
         
-        # 步骤4: 轮询状态（修改为15分钟超时）
+        # 步骤4: 轮询状态（实际15分钟超时）
         poll_count = 0
         
         while poll_count < MAX_POLL_COUNT:  # 300次 * 3秒 = 15分钟
@@ -480,7 +369,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
                 save_session_data()
         
         if poll_count >= MAX_POLL_COUNT:
-            raise Exception(f"任务处理超时 (超过{MAX_POLL_COUNT * POLL_INTERVAL // 60}分钟)")
+            raise Exception(f"任务处理超时 (超过{ACTUAL_TIMEOUT_MINUTES}分钟)")
         
         # 步骤5: 获取和下载结果
         task.progress = 95
@@ -525,7 +414,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
             processing_key = GLOBAL_PROCESSING_SET.encode()
             r.srem(processing_key, str(task.task_id))
 
-# --- 9. 队列管理函数（修复Redis编码问题） ---
+# --- 8. 队列管理函数（修复Redis编码问题） ---
 
 def get_queue_stats():
     """获取队列统计信息"""
@@ -597,21 +486,21 @@ def start_new_tasks():
     except Exception as e:
         st.error(f"启动任务时出错: {e}")
 
-# --- 10. 主界面 ---
+# --- 9. 主界面 ---
 
 def main():
     st.title("🎨 RunningHub AI - 智能图片优化工具")
     st.markdown("### 稳定高效的多页面协同处理平台")
     
-    # 系统状态信息（保留提示，不显示顶部6项指标）
-    timeout_minutes = MAX_POLL_COUNT * POLL_INTERVAL // 60
-    st.info(f"🕒 超时设置: 单个任务最长处理时间 {timeout_minutes} 分钟 | 🔄 自动刷新: {AUTO_REFRESH_INTERVAL} 秒")
+    # 系统状态信息（移动到更简洁的位置）
+    st.info(f"🕒 **预计处理时间**: {DISPLAY_TIMEOUT_MINUTES} 分钟 | 🔄 **自动刷新**: {AUTO_REFRESH_INTERVAL}秒间隔")
+    
     st.markdown("---")
     
     # 主界面布局
     left_col, right_col = st.columns([2, 3])
     
-    # 左侧：上传区域
+    # 左侧：上传区域和状态信息
     with left_col:
         st.markdown("### 📁 图片上传")
         
@@ -661,6 +550,62 @@ def main():
         
         st.markdown("---")
         
+        # 状态统计（折叠在左侧下方）
+        with st.expander("📊 系统状态", expanded=True):
+            stats = get_queue_stats()
+            local_stats = {
+                'success': sum(1 for t in st.session_state.tasks if t.status == "SUCCESS"),
+                'failed': sum(1 for t in st.session_state.tasks if t.status == "FAILED"),
+                'total': len(st.session_state.tasks)
+            }
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown(f"""
+                <div class="metric-container">
+                    <h4 style="margin:0; color:#3498db;">{stats['queued']}</h4>
+                    <p style="margin:0; color:#7f8c8d; font-size:12px;">全局队列</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="metric-container">
+                    <h4 style="margin:0; color:#27ae60;">{local_stats['success']}</h4>
+                    <p style="margin:0; color:#7f8c8d; font-size:12px;">已完成</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown(f"""
+                <div class="metric-container">
+                    <h4 style="margin:0; color:#8e44ad;">{stats['global_processing']}/{MAX_GLOBAL_CONCURRENT}</h4>
+                    <p style="margin:0; color:#7f8c8d; font-size:12px;">API总并发</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="metric-container">
+                    <h4 style="margin:0; color:#e74c3c;">{local_stats['failed']}</h4>
+                    <p style="margin:0; color:#7f8c8d; font-size:12px;">失败</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown(f"""
+                <div class="metric-container">
+                    <h4 style="margin:0; color:#e67e22;">{stats['local_processing']}/{MAX_LOCAL_CONCURRENT}</h4>
+                    <p style="margin:0; color:#7f8c8d; font-size:12px;">本页处理</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown(f"""
+                <div class="metric-container">
+                    <h4 style="margin:0; color:#9b59b6;">{local_stats['total']}</h4>
+                    <p style="margin:0; color:#7f8c8d; font-size:12px;">本页总数</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
         # 系统信息
         with st.expander("⚙️ 系统配置", expanded=False):
             if r:
@@ -671,7 +616,7 @@ def main():
             st.markdown("**系统配置:**")
             st.info(f"🌐 API总并发: {MAX_GLOBAL_CONCURRENT}")
             st.info(f"📄 单页并发: {MAX_LOCAL_CONCURRENT}")
-            st.info(f"⏰ 单任务超时: {timeout_minutes}分钟")
+            st.info(f"⏰ 显示超时: {DISPLAY_TIMEOUT_MINUTES}分钟 (实际: {ACTUAL_TIMEOUT_MINUTES}分钟)")
             st.info(f"🔁 最大重试: {MAX_RETRIES}次")
             st.info(f"🔄 自动刷新: {AUTO_REFRESH_INTERVAL}秒")
             
@@ -680,31 +625,12 @@ def main():
             
             st.markdown("**优化特性:**")
             st.markdown("""
-            - ✅ 图片显示缓存，解决闪烁问题
-            - ✅ 15分钟超时限制，适合复杂图片
+            - ✅ 预计3分钟显示，实际15分钟容错
             - ✅ 数据自动保存，页面刷新不丢失
             - ✅ 减少刷新频率，提升稳定性
+            - ✅ 简化界面，专注核心功能
             """)
-        
-        # 新增：左侧下方折叠的实时统计
-        with st.expander("📈 实时统计", expanded=False):
-            stats = get_queue_stats()
-            local_stats = {
-                'success': sum(1 for t in st.session_state.tasks if t.status == "SUCCESS"),
-                'failed': sum(1 for t in st.session_state.tasks if t.status == "FAILED"),
-                'total': len(st.session_state.tasks)
-            }
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(f"<div class='metric-container'><h3 style='margin:0;color:#3498db;'>{stats['queued']}</h3><p style='margin:0;color:#7f8c8d;'>全局队列</p></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='metric-container' style='margin-top:8px;'><h3 style='margin:0;color:#8e44ad;'>{stats['global_processing']}/{MAX_GLOBAL_CONCURRENT}</h3><p style='margin:0;color:#7f8c8d;'>API总并发</p></div>", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"<div class='metric-container'><h3 style='margin:0;color:#e67e22;'>{stats['local_processing']}/{MAX_LOCAL_CONCURRENT}</h3><p style='margin:0;color:#7f8c8d;'>本页处理</p></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='metric-container' style='margin-top:8px;'><h3 style='margin:0;color:#27ae60;'>{local_stats['success']}</h3><p style='margin:0;color:#7f8c8d;'>已完成</p></div>", unsafe_allow_html=True)
-            with c3:
-                st.markdown(f"<div class='metric-container'><h3 style='margin:0;color:#e74c3c;'>{local_stats['failed']}</h3><p style='margin:0;color:#7f8c8d;'>失败</p></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='metric-container' style='margin-top:8px;'><h3 style='margin:0;color:#9b59b6;'>{local_stats['total']}</h3><p style='margin:0;color:#7f8c8d;'>本页总数</p></div>", unsafe_allow_html=True)
-
+    
     # 右侧：任务列表
     with right_col:
         st.markdown("### 📊 任务状态")
@@ -738,34 +664,41 @@ def main():
                         else:
                             st.markdown('<span class="info-badge">⏳ 队列中</span>', unsafe_allow_html=True)
                     
-                    # 进度/时间显示（仅显示3分钟倒计时）
+                    # 进度显示（修改时间显示逻辑）
                     if task.status == "PROCESSING":
                         st.progress(task.progress / 100)
                         st.caption(f"进度: {int(task.progress)}%")
+                        
                         if task.start_time:
                             elapsed = time.time() - task.start_time
-                            remain_display = max(0, DISPLAY_ESTIMATE_SECONDS - elapsed)
-                            mm = int(remain_display // 60)
-                            ss = int(remain_display % 60)
-                            if remain_display > 0:
-                                st.caption(f"预计用时: 3:00 | 倒计时: {mm:01d}:{ss:02d}")
+                            # 显示预计3分钟倒数，但不超过3分钟
+                            display_timeout_seconds = DISPLAY_TIMEOUT_MINUTES * 60
+                            if elapsed < display_timeout_seconds:
+                                remaining_display = max(0, display_timeout_seconds - elapsed)
+                                st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒 | 预计剩余: {int(remaining_display//60)}分{int(remaining_display%60)}秒")
                             else:
-                                timeout_minutes = MAX_POLL_COUNT * POLL_INTERVAL // 60
-                                st.caption(f"已超过预计3分钟，仍在处理中（最多容错至 {timeout_minutes} 分钟）")
+                                st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒 | 正在处理中...")
                     
-                    # 统一的对比区（占位或成品），高度固定500px；同一key确保稳定不闪
-                    st.markdown("**🔍 效果对比** (左侧AI优化，右侧原图)")
-                    comparison_html = create_image_comparison_cached(task)
-                    if comparison_html:
-                        components.html(comparison_html, height=500, scrolling=False, key=f"cmp_{task.task_id}")
-                        st.caption("栏位已预留，高度固定500px；生成完成后自动更新，不会闪烁。可拖动中线对比，点右下角下载。")
-                    else:
-                        st.warning("图片组件加载中…")
-                    
-                    # 成功/失败信息
+                    # 结果显示（简化，只显示下载按钮）
                     if task.status == "SUCCESS" and task.result_data:
                         elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                         st.success(f"🎉 处理成功！用时: {elapsed_str}")
+                        
+                        # 显示优化后的图片
+                        try:
+                            result_image = Image.open(io.BytesIO(task.result_data))
+                            st.image(result_image, caption="AI优化结果", use_column_width=True)
+                        except Exception as e:
+                            st.error(f"图片显示失败: {e}")
+                        
+                        # 下载按钮
+                        st.download_button(
+                            label="📥 下载优化图片",
+                            data=task.result_data,
+                            file_name=f"optimized_{task.file_name}",
+                            mime="image/png"
+                        )
+                    
                     elif task.status == "FAILED":
                         st.error(f"💥 处理失败: {task.error_message}")
                     
@@ -778,7 +711,6 @@ def main():
             with col_clear_local:
                 if st.button("🗑️ 清空本页", help="清空当前页面的任务"):
                     st.session_state.tasks = []
-                    st.session_state.image_cache = {}
                     save_session_data()
                     st.rerun()
             
@@ -789,7 +721,6 @@ def main():
                         processing_key = GLOBAL_PROCESSING_SET.encode()
                         r.delete(queue_key, processing_key)
                         st.session_state.tasks = []
-                        st.session_state.image_cache = {}
                         save_session_data()
                         st.success("✅ 已清空全局队列")
                         st.rerun()
@@ -805,15 +736,15 @@ def main():
     st.markdown("---")
     st.markdown(f"""
     <div style='text-align: center; color: #7f8c8d; padding: 20px;'>
-        <h4 style='margin: 10px 0; color: #34495e;'>🚀 RunningHub AI - 企业级稳定版</h4>
-        <p><strong>🔧 问题修复</strong> | 图片缓存 + {MAX_POLL_COUNT * POLL_INTERVAL // 60}分钟超时 + 数据持久化</p>
-        <p><strong>⚡ 性能优化</strong> | 减少刷新频率 + 智能缓存机制</p>
-        <p><strong>🛡️ 稳定可靠</strong> | 自动保存 + 断线恢复 + 错误重试</p>
+        <h4 style='margin: 10px 0; color: #34495e;'>🚀 RunningHub AI - 简化优化版</h4>
+        <p><strong>🔧 界面优化</strong> | 状态折叠 + 预计3分钟显示 + 简化图片展示</p>
+        <p><strong>⚡ 性能优化</strong> | 减少刷新频率 + 智能时间显示</p>
+        <p><strong>🛡️ 稳定可靠</strong> | 15分钟实际容错 + 自动保存 + 错误重试</p>
         <p><strong>💾 数据安全</strong> | Redis持久化 + 会话恢复</p>
     </div>
     """, unsafe_allow_html=True)
 
-# --- 11. 应用入口和优化的自动刷新 ---
+# --- 10. 应用入口和优化的自动刷新 ---
 
 if __name__ == "__main__":
     try:
@@ -833,7 +764,7 @@ if __name__ == "__main__":
         
         # 只在必要时刷新，减少频率
         if has_processing or has_queue_items:
-            time.sleep(AUTO_REFRESH_INTERVAL)  # 增加到5秒间隔
+            time.sleep(AUTO_REFRESH_INTERVAL)  # 5秒间隔
             st.rerun()
             
     except Exception as e:
