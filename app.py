@@ -10,7 +10,7 @@ import copy
 import json
 import random
 import streamlit.components.v1 as components
-import redis # 导入redis库
+import redis 
 
 # --- 1. 全局配置和Redis初始化 ---
 
@@ -103,6 +103,10 @@ if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
+# 缓存已完成任务的HTML，避免重复加载Base64数据
+if 'completed_html_cache' not in st.session_state:
+    st.session_state.completed_html_cache = {}
+
 
 # 配置常量
 MAX_LOCAL_CONCURRENT = 5  # 本地最大并发数（已不再重要，但保留）
@@ -172,11 +176,12 @@ def update_task_from_redis_data(task: TaskItem, data: dict):
     task.status = "QUEUED" # 标记为已被调度器取出，正在排队等待线程启动
 
 
-# --- 3. 辅助函数 (保持不变) ---
+# --- 3. 辅助函数 (图片对比组件优化) ---
 
+# 修改：优化下载按钮的SVG图标，使其更像下载图标（向下箭头+底座）
 def create_before_after_comparison(original_data, result_data, task_id):
     """创建原图与结果图的滑动对比组件"""
-    # ... (与原代码相同) ...
+    # 将图片数据转换为base64
     original_b64 = base64.b64encode(original_data).decode()
     result_b64 = base64.b64encode(result_data).decode()
     
@@ -197,19 +202,18 @@ def create_before_after_comparison(original_data, result_data, task_id):
             </div>
         </div>
         
-        <div style="position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
+        <div style="position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold; z-index: 100;">
             原图
         </div>
-        <div style="position: absolute; top: 15px; left: 15px; background: rgba(52, 152, 219, 0.9); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
+        <div style="position: absolute; top: 15px; left: 15px; background: rgba(52, 152, 219, 0.9); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold; z-index: 100;">
             AI优化
         </div>
         
-        <div id="download-btn-{task_id}" style="position: absolute; bottom: 15px; right: 15px; width: 50px; height: 50px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.3); transition: all 0.3s ease;" 
+        <div id="download-btn-{task_id}" style="position: absolute; bottom: 15px; right: 15px; width: 50px; height: 50px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.3); transition: all 0.3s ease; z-index: 100;" 
              onmouseover="this.style.background='rgba(52, 152, 219, 1)'; this.style.transform='scale(1.1)'"
              onmouseout="this.style.background='rgba(52, 152, 219, 0.9)'; this.style.transform='scale(1)'">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="white">
-                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z" />
-                <path d="M12,11L16,15H13V19H11V15H8L12,11Z"/>
+                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
             </svg>
         </div>
     </div>
@@ -281,16 +285,16 @@ def create_before_after_comparison(original_data, result_data, task_id):
                 // 创建下载链接
                 const link = document.createElement('a');
                 link.href = 'data:image/png;base64,{result_b64}';
-                link.download = 'optimized_image.png';
+                link.download = 'optimized_{task_id}.png';
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
                 
                 // 显示下载提示
-                const originalText = downloadBtn.innerHTML;
-                downloadBtn.innerHTML = '<div style="color: white; font-size: 12px; font-weight: bold;">✓</div>';
+                const originalSvg = downloadBtn.innerHTML;
+                downloadBtn.innerHTML = '<div style="color: white; font-size: 18px; font-weight: bold;">✓</div>';
                 setTimeout(() => {{
-                    downloadBtn.innerHTML = originalText;
+                    downloadBtn.innerHTML = originalSvg;
                 }}, 1000);
             }});
         }}
@@ -304,6 +308,7 @@ def create_before_after_comparison(original_data, result_data, task_id):
         
         // 点击容器其他位置也可以调整
         container.addEventListener('click', function(e) {{
+            // 确保点击的不是下载按钮或手柄
             if (e.target === divider || divider.contains(e.target) || e.target === downloadBtn || downloadBtn.contains(e.target)) return;
             
             const rect = container.getBoundingClientRect();
@@ -322,8 +327,10 @@ def is_concurrent_limit_error(error_msg):
     error_msg_lower = error_msg.lower()
     return any(keyword in error_msg_lower for keyword in CONCURRENT_LIMIT_ERRORS)
 
+# ... (upload_file, run_task, fetch_task_output, download_result_image 函数保持不变) ...
+
 def upload_file(file_data, file_name, api_key):
-    """上传文件到服务器"""
+    # ... (与原代码相同) ...
     url = 'https://www.runninghub.cn/task/openapi/upload'
     
     files = {'file': (file_name, file_data)}
@@ -342,7 +349,7 @@ def upload_file(file_data, file_name, api_key):
         raise Exception(error_msg)
 
 def run_task(api_key, webapp_id, node_info_list):
-    """发起任务"""
+    # ... (与原代码相同) ...
     run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
     headers = {'Content-Type': 'application/json'}
     payload = {
@@ -364,7 +371,7 @@ def run_task(api_key, webapp_id, node_info_list):
     return task_id
 
 def fetch_task_output(api_key, task_id):
-    """获取任务输出"""
+    # ... (与原代码相同) ...
     output_url = 'https://www.runninghub.cn/task/openapi/outputs'
     
     response = requests.post(output_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
@@ -381,7 +388,7 @@ def fetch_task_output(api_key, task_id):
         raise Exception(f"获取结果失败: {data.get('msg', '未知错误')}")
 
 def download_result_image(url):
-    """下载结果图片"""
+    # ... (与原代码相同) ...
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
     content = response.content
@@ -464,8 +471,11 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
             task.progress = 100
             task.status = "SUCCESS"
             task.elapsed_time = time.time() - task.start_time
+            
+            # ⚠️ 性能优化：任务成功后，生成 HTML 并缓存
+            st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
+
         else:
-            # 理论上不会发生，因为前面已检查FAILED/超时
             raise Exception(f"任务未成功完成，最终状态: {status}")
             
     except Exception as e:
@@ -498,34 +508,8 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
 # --- 5. 主界面 ---
 
 st.title("🎨 RunningHub AI - 智能图片优化工具 (分布式队列)")
-if st.session_state.redis_connected:
-    st.markdown(f"### 状态: **✅ Redis连接成功** | 全局并发限制: **{MAX_GLOBAL_CONCURRENT}**")
-else:
-     st.error(f"❌ Redis连接失败，全局排队系统不可用。错误: {st.session_state.redis_error}")
-     st.stop()
 
-
-# 统计信息
-global_queued = r.llen(GLOBAL_TASK_QUEUE)
-global_processing = r.scard(GLOBAL_PROCESSING_SET)
-local_completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
-local_failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
-local_waiting_retry = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
-total_submitted = len(st.session_state.tasks)
-
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    st.metric("全局队列中", global_queued)
-with col2:
-    st.metric(f"全局处理中", f"{global_processing}/{MAX_GLOBAL_CONCURRENT}")
-with col3:
-    st.metric("本次提交总数", total_submitted)
-with col4:
-    st.metric("已完成", local_completed)
-with col5:
-    st.metric("本地失败/重试", f"{local_failed} / {local_waiting_retry}")
-
-st.markdown("---")
+# ⚠️ 移除顶部的统计信息，移入左侧栏底部
 
 # 左右分栏
 left_col, right_col = st.columns([2, 3])
@@ -543,35 +527,64 @@ with left_col:
     
     # 自动加入队列逻辑 (推入 Redis 队列)
     if uploaded_files:
-        new_tasks = []
-        # 添加文件到本地 session_state
-        for uploaded_file in uploaded_files:
-            st.session_state.task_counter += 1
-            task = TaskItem(
-                task_id=st.session_state.task_counter,
-                file_data=uploaded_file.getvalue(),
-                file_name=uploaded_file.name
-            )
-            st.session_state.tasks.append(task)
-            new_tasks.append(task)
-            
-        # 序列化任务信息并推入 Redis 全局队列
-        if new_tasks:
-            pipe = r.pipeline()
-            for task in new_tasks:
-                task_data_json = serialize_task_data(task)
-                pipe.rpush(GLOBAL_TASK_QUEUE, task_data_json) # 尾部插入
-            pipe.execute()
-            
-            st.success(f"已添加 {len(uploaded_files)} 个任务到**全局队列**！")
-            
-            # 清空文件上传框
-            st.session_state.file_uploader_key += 1
-            st.rerun()
+        if not st.session_state.redis_connected:
+            st.error("无法连接到Redis，请检查配置或稍后再试。")
+        else:
+            new_tasks = []
+            for uploaded_file in uploaded_files:
+                st.session_state.task_counter += 1
+                task = TaskItem(
+                    task_id=st.session_state.task_counter,
+                    file_data=uploaded_file.getvalue(),
+                    file_name=uploaded_file.name
+                )
+                st.session_state.tasks.append(task)
+                new_tasks.append(task)
+                
+            if new_tasks:
+                pipe = r.pipeline()
+                for task in new_tasks:
+                    task_data_json = serialize_task_data(task)
+                    pipe.rpush(GLOBAL_TASK_QUEUE, task_data_json) # 尾部插入
+                pipe.execute()
+                
+                st.success(f"已添加 {len(uploaded_files)} 个任务到**全局队列**！")
+                
+                st.session_state.file_uploader_key += 1
+                st.rerun()
     
     st.markdown("---")
     
-    with st.expander("⚙️ API 配置信息", expanded=False):
+    # ⚠️ 顶部信息和API配置信息移入左侧栏底部的折叠容器
+    
+    with st.expander("📊 全局状态与API配置信息", expanded=False):
+        
+        # 状态信息
+        if st.session_state.redis_connected:
+            st.markdown(f"**Redis状态:** ✅ 连接成功 | 全局并发限制: **{MAX_GLOBAL_CONCURRENT}**")
+            
+            global_queued = r.llen(GLOBAL_TASK_QUEUE)
+            global_processing = r.scard(GLOBAL_PROCESSING_SET)
+            local_completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
+            local_failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
+            local_waiting_retry = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
+            total_submitted = len(st.session_state.tasks)
+
+            st.markdown("""
+            | 状态指标 | 数值 |
+            | :--- | :--- |
+            | **全局队列中** | {} |
+            | **全局处理中** | {} / {} |
+            | **本次提交总数** | {} |
+            | **已完成 (本地)** | {} |
+            | **本地失败/重试** | {} / {} |
+            """.format(global_queued, global_processing, MAX_GLOBAL_CONCURRENT, total_submitted, local_completed, local_failed, local_waiting_retry))
+            
+        else:
+            st.error(f"❌ Redis连接失败，全局排队系统不可用。错误: {st.session_state.redis_error}")
+        
+        st.markdown("---")
+        st.markdown("**API配置信息：**")
         st.text_input("API Key", value=API_KEY, disabled=True)
         st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
         st.markdown("**Redis连接信息：**")
@@ -584,6 +597,7 @@ with left_col:
         st.markdown("**节点信息配置：**")
         st.json(NODE_INFO)
 
+
 with right_col:
     st.markdown("### 📊 任务队列 (本地视图)")
     
@@ -592,45 +606,44 @@ with right_col:
     else:
         # --- 核心：全局调度器 (在此机器上运行) ---
         
-        # 1. 获取当前全局正在处理的任务数
-        global_processing_count = r.scard(GLOBAL_PROCESSING_SET)
-        available_slots = MAX_GLOBAL_CONCURRENT - global_processing_count
+        if st.session_state.redis_connected:
+            global_processing_count = r.scard(GLOBAL_PROCESSING_SET)
+            available_slots = MAX_GLOBAL_CONCURRENT - global_processing_count
+            
+            # 2. 从全局任务队列拉取任务 (如果还有空位)
+            if available_slots > 0:
+                for _ in range(available_slots):
+                    task_json = r.lpop(GLOBAL_TASK_QUEUE)
+                    
+                    if task_json:
+                        task_data = json.loads(task_json)
+                        task_id = task_data['task_id']
+                        
+                        local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
+                        
+                        if local_task and local_task.file_data:
+                            update_task_from_redis_data(local_task, task_data) 
+                            
+                            # 立即将任务ID加入全局处理集合，占据槽位
+                            r.sadd(GLOBAL_PROCESSING_SET, str(local_task.task_id))
+                            
+                            thread = threading.Thread(
+                                target=process_single_task,
+                                args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO, r, GLOBAL_PROCESSING_SET, GLOBAL_TASK_QUEUE)
+                            )
+                            thread.daemon = True
+                            thread.start()
+                            
+                            local_task.status = "UPLOADING" 
+                            
+                        else:
+                            # 任务ID在全局队列中，但不在本地 session_state 中 (其他机器上传的任务)
+                            # 由于无法处理，此任务被丢弃。如果需要其他机器处理，应使用更复杂的机制。
+                            # ⚠️ 再次将其放回队列，让其他机器有机会处理（仅针对并发失败重试的任务）
+                            if task_data.get('retry_count', 0) > 0:
+                                r.rpush(GLOBAL_TASK_QUEUE, task_json)
+                            # 如果是新上传的任务，说明此机器未保存文件数据，跳过
         
-        # 2. 从全局任务队列拉取任务 (如果还有空位)
-        if available_slots > 0:
-            # 批量尝试从队列左侧取出任务
-            for _ in range(available_slots):
-                task_json = r.lpop(GLOBAL_TASK_QUEUE)
-                
-                if task_json:
-                    task_data = json.loads(task_json)
-                    task_id = task_data['task_id']
-                    
-                    # 尝试从本地 session_state 中找到对应的 TaskItem
-                    local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
-                    
-                    if local_task and local_task.file_data:
-                        # 找到且文件数据仍在本地：调度器启动任务
-                        update_task_from_redis_data(local_task, task_data) # 更新状态和重试信息
-                        
-                        # ⚠️ 立即将任务ID加入全局处理集合，占据槽位
-                        r.sadd(GLOBAL_PROCESSING_SET, str(local_task.task_id))
-                        
-                        # 启动线程
-                        thread = threading.Thread(
-                            target=process_single_task,
-                            args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO, r, GLOBAL_PROCESSING_SET, GLOBAL_TASK_QUEUE)
-                        )
-                        thread.daemon = True
-                        thread.start()
-                        
-                        local_task.status = "UPLOADING" # 标记为本地处理中
-                        
-                    else:
-                        # 任务ID在全局队列中，但不在本地 session_state 中 (其他机器上传的任务)
-                        # 此处只需打印警告/日志，因为该机器没有文件数据，无法处理
-                        st.warning(f"检测到其他机器上传的任务: Task-{task_id}，但此机器没有文件数据。跳过。")
-                        
         # --- 调度器结束 ---
         
         # 显示所有任务
@@ -651,7 +664,6 @@ with right_col:
                     elif task.status in ["UPLOADING", "PROCESSING"]:
                         st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
                     elif task.status == "WAITING":
-                        # 重新入队等待被调度器再次取出
                         st.markdown('<span class="waiting-badge">⏳ 等待重试/重新排队</span>', unsafe_allow_html=True) 
                     elif task.status == "QUEUED":
                         st.markdown('<span class="info-badge">⏸️ 已被调度，等待线程启动</span>', unsafe_allow_html=True)
@@ -672,14 +684,14 @@ with right_col:
                 elif task.status == "WAITING":
                     st.info(task.error_message)
                 
-                # 结果显示 - 使用滑动对比
-                if task.status == "SUCCESS" and task.result_data:
+                # 结果显示 - 使用缓存的 HTML
+                if task.status == "SUCCESS" and task.task_id in st.session_state.completed_html_cache:
                     elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                     st.success(f"✅ 处理完成！用时: {elapsed_str}")
                     
                     st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
-                    comparison_html = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
-                    components.html(comparison_html, height=600)
+                    # 使用缓存的 HTML，避免重复 Base64 加载
+                    components.html(st.session_state.completed_html_cache[task.task_id], height=600)
                     
                     st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
                 
@@ -689,16 +701,21 @@ with right_col:
                 st.markdown('</div>', unsafe_allow_html=True)
                 st.markdown("---")
         
-        if st.button("🗑️ 清空本地任务 (不影响全局队列和处理中的任务)"):
-            st.session_state.tasks = []
-            st.rerun()
-            
-        if st.button("🔥 清空全局队列和处理中的任务 (危险操作，需谨慎)"):
-            r.delete(GLOBAL_TASK_QUEUE)
-            r.delete(GLOBAL_PROCESSING_SET)
-            st.session_state.tasks = []
-            st.success("已清空全局队列和处理中的任务！")
-            st.rerun()
+        # 清空按钮
+        col_local, col_global = st.columns(2)
+        with col_local:
+            if st.button("🗑️ 清空本地任务"):
+                st.session_state.tasks = []
+                st.session_state.completed_html_cache = {}
+                st.rerun()
+        with col_global:
+            if st.button("🔥 清空全局队列和处理中的任务", help="**危险操作**：会停止所有机器上正在处理的任务，并清空所有排队任务。"):
+                r.delete(GLOBAL_TASK_QUEUE)
+                r.delete(GLOBAL_PROCESSING_SET)
+                st.session_state.tasks = []
+                st.session_state.completed_html_cache = {}
+                st.success("已清空全局队列和处理中的任务！")
+                st.rerun()
 
 
 # 页脚
@@ -707,13 +724,15 @@ st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
     <p>🚀 基于Redis实现分布式限流，**全局并发限制在5**，多机器提交任务自动排队</p>
     <p>📤 上传文件后，任务进入Redis全局队列，由任一空闲机器调度处理</p>
-    <p>🔍 完成后支持原图与AI优化图片的滑动对比预览</p>
+    <p>🔍 **性能优化**：图片对比预览已缓存，避免重复加载导致卡顿</p>
 </div>
 """, unsafe_allow_html=True)
 
-# 自动刷新 (当本地有任务在处理，或者全局队列不为空时)
-if (any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "QUEUED"] for t in st.session_state.tasks) or
-    (st.session_state.redis_connected and r.llen(GLOBAL_TASK_QUEUE) > 0) or
-    (st.session_state.redis_connected and r.scard(GLOBAL_PROCESSING_SET) > 0)):
+# 自动刷新 
+if (st.session_state.redis_connected and (
+    any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "QUEUED"] for t in st.session_state.tasks) or
+    r.llen(GLOBAL_TASK_QUEUE) > 0 or
+    r.scard(GLOBAL_PROCESSING_SET) > 0
+)):
     time.sleep(2)
     st.rerun()
