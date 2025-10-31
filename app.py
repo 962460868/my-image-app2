@@ -71,31 +71,85 @@ st.markdown("""
         color: #ff6b6b;
         font-weight: bold;
     }
+    .redis-status {
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
+    }
+    .redis-success {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+    }
+    .redis-error {
+        background-color: #f8d7da;
+        border: 1px solid #f5c6cb;
+        color: #721c24;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Redis配置 - 从环境变量读取
+# Redis配置 - 针对Redis Cloud优化
 def get_redis_config():
-    """从环境变量获取Redis配置"""
+    """从Streamlit secrets或环境变量获取Redis配置"""
+    try:
+        # 优先从Streamlit secrets读取
+        if hasattr(st, 'secrets') and st.secrets:
+            if "REDIS_URL" in st.secrets:
+                redis_url = st.secrets["REDIS_URL"]
+                parsed = urlparse(redis_url)
+                return {
+                    'host': parsed.hostname,
+                    'port': parsed.port or 6379,
+                    'password': parsed.password,
+                    'db': int(parsed.path.lstrip('/')) if parsed.path and parsed.path != '/' else 0,
+                    'ssl': True,
+                    'ssl_cert_reqs': None,
+                    'ssl_check_hostname': False,
+                    'ssl_ca_certs': None
+                }
+            elif "REDIS_HOST" in st.secrets:
+                return {
+                    'host': st.secrets["REDIS_HOST"],
+                    'port': int(st.secrets["REDIS_PORT"]),
+                    'password': st.secrets["REDIS_PASSWORD"],
+                    'db': int(st.secrets.get("REDIS_DB", 0)),
+                    'ssl': True,
+                    'ssl_cert_reqs': None,
+                    'ssl_check_hostname': False,
+                    'ssl_ca_certs': None
+                }
+    except Exception as e:
+        st.warning(f"读取Streamlit secrets时出错: {e}")
+    
+    # 回退到环境变量
     redis_url = os.getenv('REDIS_URL')
     if redis_url:
-        # 解析Redis URL
         parsed = urlparse(redis_url)
         return {
             'host': parsed.hostname,
             'port': parsed.port or 6379,
             'password': parsed.password,
-            'db': 0
+            'db': int(parsed.path.lstrip('/')) if parsed.path and parsed.path != '/' else 0,
+            'ssl': True,
+            'ssl_cert_reqs': None,
+            'ssl_check_hostname': False,
+            'ssl_ca_certs': None
         }
-    else:
-        # 从单独的环境变量读取
-        return {
-            'host': os.getenv('REDIS_HOST', 'localhost'),
-            'port': int(os.getenv('REDIS_PORT', 6379)),
-            'password': os.getenv('REDIS_PASSWORD'),
-            'db': int(os.getenv('REDIS_DB', 0))
-        }
+    
+    # 默认配置 - 使用你的Redis Cloud信息
+    return {
+        'host': os.getenv('REDIS_HOST', 'redis-18743.c340.ap-northeast-2-1.ec2.redns.redis-cloud.com'),
+        'port': int(os.getenv('REDIS_PORT', 18743)),
+        'password': os.getenv('REDIS_PASSWORD', 'dBAPubXYReEwHaIvnvX0lvr3qIgtudCp'),
+        'db': int(os.getenv('REDIS_DB', 0)),
+        'ssl': True,
+        'ssl_cert_reqs': None,
+        'ssl_check_hostname': False,
+        'ssl_ca_certs': None
+    }
 
+# 获取Redis配置
 REDIS_CONFIG = get_redis_config()
 TOKEN_BUCKET_KEY = "ai_processing_tokens"  # Redis中令牌桶的键名
 GLOBAL_CONCURRENT_LIMIT = 5  # 全局并发限制
@@ -107,8 +161,8 @@ if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
-if 'redis_client' not in st.session_state:
-    st.session_state.redis_client = None
+if 'redis_connection_status' not in st.session_state:
+    st.session_state.redis_connection_status = None
 
 # 配置常量
 API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
@@ -122,7 +176,7 @@ NODE_INFO = [
 # API并发限制相关的错误关键词
 CONCURRENT_LIMIT_ERRORS = [
     "concurrent limit",
-    "too many requests",
+    "too many requests", 
     "rate limit",
     "队列已满",
     "并发限制",
@@ -152,10 +206,13 @@ class RedisTokenManager:
                     token_id = f"token_{i+1}_{int(time.time())}"
                     self.redis_client.lpush(self.bucket_key, token_id)
                 st.success(f"✅ 已初始化 {self.max_tokens} 个全局处理令牌")
+                st.session_state.redis_connection_status = "initialized"
             else:
                 st.info(f"ℹ️ 发现现有令牌桶，当前可用令牌数：{current_tokens}")
+                st.session_state.redis_connection_status = "connected"
         except Exception as e:
             st.error(f"❌ 初始化令牌桶失败：{str(e)}")
+            st.session_state.redis_connection_status = "error"
     
     def acquire_token(self, timeout=0):
         """获取令牌（阻塞操作）"""
@@ -166,7 +223,7 @@ class RedisTokenManager:
                 result = self.redis_client.brpop(self.bucket_key, timeout=0)
             
             if result:
-                return result[1].decode('utf-8')  # 返回令牌ID
+                return result[1].decode('utf-8')
             return None
         except Exception as e:
             logging.error(f"获取令牌失败：{str(e)}")
@@ -201,15 +258,38 @@ def get_redis_client():
             port=REDIS_CONFIG['port'],
             password=REDIS_CONFIG['password'],
             db=REDIS_CONFIG['db'],
+            ssl=REDIS_CONFIG.get('ssl', True),
+            ssl_cert_reqs=REDIS_CONFIG.get('ssl_cert_reqs'),
+            ssl_check_hostname=REDIS_CONFIG.get('ssl_check_hostname', False),
+            ssl_ca_certs=REDIS_CONFIG.get('ssl_ca_certs'),
             decode_responses=False,  # 手动处理编码
-            socket_timeout=10,
-            socket_connect_timeout=10,
+            socket_timeout=15,
+            socket_connect_timeout=15,
             retry_on_timeout=True,
+            retry_on_error=[redis.ConnectionError, redis.TimeoutError],
             health_check_interval=30
         )
+        
         # 测试连接
         client.ping()
+        
+        # 获取Redis服务器信息
+        info = client.info()
+        st.session_state.redis_info = {
+            'redis_version': info.get('redis_version', 'Unknown'),
+            'used_memory_human': info.get('used_memory_human', 'Unknown'),
+            'connected_clients': info.get('connected_clients', 0)
+        }
+        
         return client
+    except redis.ConnectionError as e:
+        st.error(f"❌ Redis连接错误：{str(e)}")
+        st.error("请检查Redis Cloud服务状态和网络连接")
+        return None
+    except redis.AuthenticationError as e:
+        st.error(f"❌ Redis认证失败：{str(e)}")
+        st.error("请检查Redis密码是否正确")
+        return None
     except Exception as e:
         st.error(f"❌ Redis连接失败：{str(e)}")
         st.error(f"配置信息: {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
@@ -230,39 +310,33 @@ class TaskItem:
         self.created_at = datetime.now()
         self.start_time = None
         self.elapsed_time = None
-        self.retry_count = 0  # 重试次数
-        self.max_retries = 10  # 最大重试次数
-        self.token_id = None  # 当前持有的令牌ID
-        self.waiting_for_token = False  # 是否正在等待令牌
+        self.retry_count = 0
+        self.max_retries = 10
+        self.token_id = None
+        self.waiting_for_token = False
 
 def create_before_after_comparison(original_data, result_data, task_id):
     """创建原图与结果图的滑动对比组件"""
-    # 将图片数据转换为base64
     original_b64 = base64.b64encode(original_data).decode()
     result_b64 = base64.b64encode(result_data).decode()
     
     html_code = f"""
     <div id="comparison-container-{task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
-        <!-- 原图 (背景层) -->
         <img id="original-{task_id}" src="data:image/png;base64,{original_b64}" 
              style="width: 100%; height: auto; display: block;" alt="原图">
         
-        <!-- 结果图 (遮罩层) -->
         <div id="result-overlay-{task_id}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden;">
             <img id="result-{task_id}" src="data:image/png;base64,{result_b64}" 
                  style="width: 100%; height: 100%; object-fit: cover;" alt="优化后">
         </div>
         
-        <!-- 分割线 -->
         <div id="divider-{task_id}" style="position: absolute; top: 0; width: 4px; height: 100%; background: linear-gradient(to bottom, #fff 0%, #3498db 50%, #fff 100%); cursor: ew-resize; z-index: 10; left: 50%; margin-left: -2px; box-shadow: 0 0 10px rgba(0,0,0,0.3);">
-            <!-- 拖动手柄 -->
             <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 40px; height: 40px; background: #3498db; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">
                 <div style="width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-top: 6px solid white; margin-right: 2px;"></div>
                 <div style="width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-bottom: 6px solid white; margin-left: 2px;"></div>
             </div>
         </div>
         
-        <!-- 标签 -->
         <div style="position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
             原图
         </div>
@@ -270,7 +344,6 @@ def create_before_after_comparison(original_data, result_data, task_id):
             AI优化
         </div>
         
-        <!-- 下载按钮 -->
         <div id="download-btn-{task_id}" style="position: absolute; bottom: 15px; right: 15px; width: 50px; height: 50px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.3); transition: all 0.3s ease;" 
              onmouseover="this.style.background='rgba(52, 152, 219, 1)'; this.style.transform='scale(1.1)'"
              onmouseout="this.style.background='rgba(52, 152, 219, 0.9)'; this.style.transform='scale(1)'">
@@ -303,26 +376,21 @@ def create_before_after_comparison(original_data, result_data, task_id):
         function startDrag(e) {{
             isDragging = true;
             startX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
-            
             const rect = container.getBoundingClientRect();
             const currentLeft = parseFloat(divider.style.left) || 50;
             startLeft = currentLeft;
-            
             document.addEventListener(e.type.includes('touch') ? 'touchmove' : 'mousemove', handleDrag);
             document.addEventListener(e.type.includes('touch') ? 'touchend' : 'mouseup', stopDrag);
-            
             e.preventDefault();
         }}
         
         function handleDrag(e) {{
             if (!isDragging) return;
-            
             const currentX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
             const rect = container.getBoundingClientRect();
             const deltaX = currentX - startX;
             const deltaPercentage = (deltaX / rect.width) * 100;
             const newPercentage = startLeft + deltaPercentage;
-            
             updateComparison(newPercentage);
             e.preventDefault();
         }}
@@ -340,7 +408,7 @@ def create_before_after_comparison(original_data, result_data, task_id):
                 e.stopPropagation();
                 const link = document.createElement('a');
                 link.href = 'data:image/png;base64,{result_b64}';
-                link.download = 'optimized_image.png';
+                link.download = 'optimized_image_{task_id}.png';
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
@@ -354,13 +422,11 @@ def create_before_after_comparison(original_data, result_data, task_id):
         }}
         
         updateComparison(70);
-        
         divider.addEventListener('mousedown', startDrag);
         divider.addEventListener('touchstart', startDrag);
         
         container.addEventListener('click', function(e) {{
             if (e.target === divider || divider.contains(e.target) || e.target === downloadBtn || downloadBtn.contains(e.target)) return;
-            
             const rect = container.getBoundingClientRect();
             const clickX = e.clientX - rect.left;
             const percentage = (clickX / rect.width) * 100;
@@ -568,12 +634,18 @@ if redis_client:
         )
 
 # 主界面
-st.title("🎨 RunningHub AI - 智能图片优化工具（Redis分布式版）")
+st.title("🎨 RunningHub AI - 智能图片优化工具（Redis Cloud版）")
 st.markdown("### 专业的AI图片优化和增强服务 - 支持多实例水平扩容")
 
-# Redis连接状态
+# Redis连接状态显示
 if redis_client:
-    st.success("✅ Redis连接正常")
+    col_status1, col_status2 = st.columns([1, 1])
+    with col_status1:
+        st.markdown('<div class="redis-status redis-success">✅ Redis Cloud 连接正常</div>', unsafe_allow_html=True)
+    with col_status2:
+        if 'redis_info' in st.session_state:
+            info = st.session_state.redis_info
+            st.info(f"🖥️ Redis版本: {info['redis_version']} | 内存使用: {info['used_memory_human']}")
     
     # 获取令牌状态
     if 'token_manager' in st.session_state:
@@ -583,8 +655,17 @@ if redis_client:
         available_tokens = 0
         processing_count = 0
 else:
-    st.error("❌ Redis连接失败，无法使用分布式并发控制")
-    st.error("请检查环境变量配置")
+    st.markdown('<div class="redis-status redis-error">❌ Redis Cloud 连接失败，无法使用分布式并发控制</div>', unsafe_allow_html=True)
+    st.error("请检查Redis Cloud配置和网络连接")
+    
+    # 显示配置信息用于调试
+    with st.expander("🔧 配置调试信息", expanded=True):
+        st.json({
+            "host": REDIS_CONFIG['host'],
+            "port": REDIS_CONFIG['port'],
+            "ssl": REDIS_CONFIG.get('ssl', False),
+            "password_length": len(REDIS_CONFIG['password']) if REDIS_CONFIG['password'] else 0
+        })
     st.stop()
 
 # 统计信息
@@ -608,11 +689,19 @@ with col6:
     st.metric("失败", failed)
 
 # 令牌状态显示
-col_token1, col_token2 = st.columns(2)
+col_token1, col_token2, col_token3 = st.columns(3)
 with col_token1:
-    st.info(f"🎫 可用令牌数：{available_tokens}")
+    st.info(f"🎫 可用令牌: {available_tokens}")
 with col_token2:
-    st.info(f"🔄 全局处理中：{processing_count}")
+    st.info(f"🔄 全局处理中: {processing_count}")
+with col_token3:
+    connection_status = st.session_state.redis_connection_status or "unknown"
+    if connection_status == "initialized":
+        st.success("🚀 令牌桶已初始化")
+    elif connection_status == "connected":
+        st.success("🔗 已连接到现有令牌桶")
+    else:
+        st.warning("⚠️ 令牌桶状态未知")
 
 st.markdown("---")
 
@@ -650,32 +739,64 @@ with left_col:
     
     st.markdown("---")
     
-    # 队列状态说明
-    with st.expander("📊 状态说明", expanded=False):
-        st.markdown("""
-        - **队列中**: 等待开始处理
-        - **等待令牌**: 正在等待获取全局处理令牌
-        - **本地处理中**: 本实例正在处理的任务
-        - **全局处理中**: 所有实例正在处理的任务总数
-        - **已完成**: 处理成功
-        - **失败**: 处理失败（超过重试次数）
+    # 系统状态
+    with st.expander("📊 系统状态", expanded=True):
+        st.markdown(f"""
+        **Redis Cloud 状态**:
+        - 🖥️ 主机: `{REDIS_CONFIG['host']}`
+        - 🔌 端口: `{REDIS_CONFIG['port']}`
+        - 🔐 SSL加密: ✅
+        - 🎫 令牌桶: `{TOKEN_BUCKET_KEY}`
+        - 🔄 全局并发限制: `{GLOBAL_CONCURRENT_LIMIT}`
         
-        **Redis分布式特性**：
-        - 全局并发限制：{} 个任务
-        - 多实例共享令牌桶
-        - 自动负载均衡
-        """.format(GLOBAL_CONCURRENT_LIMIT))
+        **分布式特性**:
+        - ✅ 多实例共享令牌桶
+        - ✅ 自动负载均衡
+        - ✅ 跨机器并发控制
+        """)
     
-    with st.expander("⚙️ Redis & API 配置", expanded=False):
-        st.markdown("**Redis配置：**")
-        st.text(f"Host: {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
-        st.text(f"Database: {REDIS_CONFIG['db']}")
-        st.text(f"令牌桶Key: {TOKEN_BUCKET_KEY}")
-        st.text(f"全局并发限制: {GLOBAL_CONCURRENT_LIMIT}")
+    # 测试功能
+    with st.expander("🔧 系统测试", expanded=False):
+        col_test1, col_test2 = st.columns(2)
         
-        st.markdown("**API配置：**")
-        st.text_input("API Key", value=API_KEY, disabled=True)
-        st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
+        with col_test1:
+            if st.button("🔍 测试Redis连接"):
+                try:
+                    if redis_client:
+                        redis_client.ping()
+                        st.success("✅ Redis连接测试成功!")
+                        
+                        # 显示详细信息
+                        info = redis_client.info()
+                        st.json({
+                            "服务器版本": info.get('redis_version'),
+                            "运行时间": f"{info.get('uptime_in_days', 0)}天",
+                            "内存使用": info.get('used_memory_human'),
+                            "连接客户端": info.get('connected_clients')
+                        })
+                    else:
+                        st.error("❌ Redis客户端未初始化")
+                except Exception as e:
+                    st.error(f"❌ 连接测试失败: {str(e)}")
+        
+        with col_test2:
+            if st.button("🎫 检查令牌状态"):
+                if 'token_manager' in st.session_state:
+                    try:
+                        available = st.session_state.token_manager.get_available_tokens()
+                        processing = st.session_state.token_manager.get_processing_count()
+                        st.success(f"✅ 可用令牌: {available}")
+                        st.info(f"🔄 处理中: {processing}")
+                        
+                        # 显示令牌详情
+                        if available > 0:
+                            st.write("令牌桶状态正常")
+                        else:
+                            st.warning("所有令牌都在使用中")
+                    except Exception as e:
+                        st.error(f"❌ 检查失败: {str(e)}")
+                else:
+                    st.error("❌ 令牌管理器未初始化")
 
 with right_col:
     st.markdown("### 📊 任务队列")
@@ -683,7 +804,7 @@ with right_col:
     if not st.session_state.tasks:
         st.info("暂无任务，请上传图片开始处理")
     else:
-        # 启动新任务的逻辑 - 移除了本地并发限制，完全依赖Redis令牌
+        # 启动新任务的逻辑
         for task in st.session_state.tasks:
             if task.status == "QUEUED" and 'token_manager' in st.session_state:
                 thread = threading.Thread(
@@ -756,18 +877,26 @@ with right_col:
                 st.markdown('</div>', unsafe_allow_html=True)
                 st.markdown("---")
         
-        if st.button("🗑️ 清空所有任务"):
-            st.session_state.tasks = []
-            st.rerun()
+        # 清空按钮
+        col_clear1, col_clear2 = st.columns([1, 1])
+        with col_clear1:
+            if st.button("🗑️ 清空所有任务"):
+                st.session_state.tasks = []
+                st.rerun()
+        with col_clear2:
+            if st.button("🧹 清空已完成任务"):
+                st.session_state.tasks = [t for t in st.session_state.tasks if t.status not in ["SUCCESS", "FAILED"]]
+                st.rerun()
 
 # 页脚
 st.markdown("---")
 st.markdown(f"""
 <div style='text-align: center; color: #7f8c8d;'>
-    <p>🚀 支持Redis分布式令牌桶，全局并发限制={GLOBAL_CONCURRENT_LIMIT}个任务</p>
-    <p>📤 多实例水平扩容，自动负载均衡和令牌管理</p>
+    <p>🚀 <strong>Redis Cloud分布式架构</strong> - 全局并发限制: {GLOBAL_CONCURRENT_LIMIT} 个任务</p>
+    <p>📤 支持多实例水平扩容，自动负载均衡和令牌管理</p>
     <p>🔍 完成后支持原图与AI优化图片的滑动对比预览，点击图片右下角图标直接下载</p>
-    <p>🎫 当前可用令牌: {available_tokens}/{GLOBAL_CONCURRENT_LIMIT}</p>
+    <p>🎫 当前系统状态: 可用令牌 {available_tokens}/{GLOBAL_CONCURRENT_LIMIT} | 全局处理中 {processing_count}</p>
+    <p>🌐 Redis Cloud: <code>{REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}</code></p>
 </div>
 """, unsafe_allow_html=True)
 
