@@ -1,4 +1,4 @@
 streamlit
 requests
 Pillow
-streamlit-server-state
+redis
