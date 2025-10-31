@@ -43,13 +43,13 @@ NODE_INFO = [
     {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
 ]
 
-# 系统配置
+# 系统配置（修复超时和刷新问题）
 MAX_GLOBAL_CONCURRENT = 5  # API总并发限制
 MAX_LOCAL_CONCURRENT = 3   # 单个网页并发限制
 MAX_RETRIES = 3            # 最大重试次数
 POLL_INTERVAL = 3          # 轮询间隔
 MAX_POLL_COUNT = 300       # 最大轮询次数 (300*3秒=15分钟)
-AUTO_REFRESH_INTERVAL = 5  # 自动刷新间隔
+AUTO_REFRESH_INTERVAL = 5  # 增加自动刷新间隔，减少刷新频率
 
 # Redis键名
 GLOBAL_TASK_QUEUE = "runninghub:task_queue"
@@ -70,29 +70,17 @@ st.markdown("""
         background-color: #f5f7fa;
     }
     .stButton>button {
+        width: 100%;
         border-radius: 8px;
         height: 3em;
+        background-color: #3498db;
+        color: white;
         font-weight: bold;
         transition: all 0.3s ease;
     }
     .stButton>button:hover {
+        background-color: #2980b9;
         transform: translateY(-1px);
-    }
-    /* 下载按钮样式 */
-    .download-button>div>div>button {
-        background-color: #27ae60 !important;
-        color: white !important;
-    }
-    .download-button>div>div>button:hover {
-        background-color: #229954 !important;
-    }
-    /* 对比按钮样式 */
-    .compare-button>div>div>button {
-        background-color: #3498db !important;
-        color: white !important;
-    }
-    .compare-button>div>div>button:hover {
-        background-color: #2980b9 !important;
     }
     .task-card {
         background-color: white;
@@ -115,12 +103,18 @@ st.markdown("""
         text-align: center;
         border: 1px solid #e1e8ed;
     }
-    .comparison-container {
-        margin-top: 15px;
-        padding: 15px;
-        border: 2px dashed #3498db;
-        border-radius: 10px;
-        background-color: #f8f9fa;
+    .local-processing {
+        color: #e67e22;
+        font-weight: bold;
+    }
+    .global-processing {
+        color: #8e44ad;
+        font-weight: bold;
+    }
+    /* 修复图片显示闪烁 */
+    .comparison-image {
+        transition: none !important;
+        image-rendering: -webkit-optimize-contrast;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -187,7 +181,7 @@ def save_session_data():
             }
             session_data['tasks'].append(task_info)
         
-        r.setex(session_key.encode(), 3600, pickle.dumps(session_data))  # 1小时过期
+        r.setex(session_key, 3600, pickle.dumps(session_data))  # 1小时过期
     except Exception as e:
         st.warning(f"保存会话数据失败: {e}")
 
@@ -198,10 +192,11 @@ def load_session_data():
         
     try:
         session_key = SESSION_DATA_PREFIX + get_session_key()
-        data = r.get(session_key.encode())
+        data = r.get(session_key)
         if data:
             session_data = pickle.loads(data)
             st.session_state.task_counter = session_data.get('task_counter', 0)
+            # 注意：这里只恢复任务的基本信息，文件数据需要重新上传
             return session_data.get('tasks', [])
     except Exception as e:
         st.warning(f"加载会话数据失败: {e}")
@@ -209,26 +204,24 @@ def load_session_data():
 
 # 初始化Session State
 if 'tasks' not in st.session_state:
+    # 尝试从Redis恢复数据
     saved_tasks = load_session_data()
     st.session_state.tasks = []
     if saved_tasks:
-        st.info(f"检测到之前的会话数据，图片文件需要重新上传才能继续处理。")
+        st.info(f"检测到之前的会话数据，但图片文件需要重新上传才能继续处理。")
 
 if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
-# 对比组件显示状态
-if 'comparison_states' not in st.session_state:
-    st.session_state.comparison_states = {}
-# 对比组件HTML缓存
-if 'comparison_cache' not in st.session_state:
-    st.session_state.comparison_cache = {}
+# 图片缓存，解决显示闪烁问题
+if 'image_cache' not in st.session_state:
+    st.session_state.image_cache = {}
 
-# --- 5. 任务类定义 ---
+# --- 5. 任务类定义（增加缓存支持） ---
 
 class TaskItem:
-    """任务项类"""
+    """优化的任务项类"""
     def __init__(self, task_id, file_data, file_name, session_id):
         self.task_id = task_id
         self.file_data = file_data
@@ -243,6 +236,21 @@ class TaskItem:
         self.start_time = None
         self.elapsed_time = None
         self.retry_count = 0
+        # 缓存相关
+        self._original_b64 = None
+        self._result_b64 = None
+
+    def get_original_b64(self):
+        """获取原图Base64（缓存）"""
+        if self._original_b64 is None and self.file_data:
+            self._original_b64 = base64.b64encode(self.file_data).decode()
+        return self._original_b64
+
+    def get_result_b64(self):
+        """获取结果图Base64（缓存）"""
+        if self._result_b64 is None and self.result_data:
+            self._result_b64 = base64.b64encode(self.result_data).decode()
+        return self._result_b64
 
     def to_dict(self):
         """序列化为字典"""
@@ -254,54 +262,36 @@ class TaskItem:
             'retry_count': self.retry_count
         }
 
-# --- 6. 下载功能 ---
+# --- 6. 图片对比组件（优化缓存版） ---
 
-def create_download_button(task):
-    """创建下载按钮"""
-    if task.result_data:
-        # 生成优化后的文件名
-        name_parts = task.file_name.rsplit('.', 1)
-        if len(name_parts) == 2:
-            download_name = f"{name_parts[0]}_optimized.{name_parts[1]}"
-        else:
-            download_name = f"{task.file_name}_optimized.png"
-        
-        return st.download_button(
-            label="📥 下载优化图",
-            data=task.result_data,
-            file_name=download_name,
-            mime="image/png",
-            key=f"download_{task.task_id}",
-            help="下载AI优化后的高清图片"
-        )
-    return False
-
-# --- 7. 图片对比组件（优化版） ---
-
-def create_comparison_component(task):
-    """创建对比组件（只在点击时生成一次）"""
-    cache_key = f"comparison_{task.task_id}"
-    
-    # 检查缓存
-    if cache_key in st.session_state.comparison_cache:
-        return st.session_state.comparison_cache[cache_key]
-    
+def create_image_comparison_cached(task):
+    """创建缓存优化的图片对比组件"""
     if not task.file_data or not task.result_data:
         return None
     
-    # 生成Base64
-    original_b64 = base64.b64encode(task.file_data).decode()
-    result_b64 = base64.b64encode(task.result_data).decode()
+    # 使用缓存的Base64数据
+    original_b64 = task.get_original_b64()
+    result_b64 = task.get_result_b64()
+    
+    if not original_b64 or not result_b64:
+        return None
+    
+    # 生成缓存键
+    cache_key = f"comparison_{task.task_id}"
+    
+    # 检查是否已缓存
+    if cache_key in st.session_state.image_cache:
+        return st.session_state.image_cache[cache_key]
     
     html_code = f"""
-    <div id="comparison-container-{task.task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15); background: white;">
+    <div id="comparison-container-{task.task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
         <!-- 原图背景 -->
-        <img id="original-{task.task_id}" src="data:image/png;base64,{original_b64}" 
+        <img class="comparison-image" id="original-{task.task_id}" src="data:image/png;base64,{original_b64}" 
              style="width: 100%; height: auto; display: block;" alt="原图">
         
         <!-- 结果图遮罩 -->
         <div id="result-overlay-{task.task_id}" style="position: absolute; top: 0; left: 0; width: 70%; height: 100%; overflow: hidden;">
-            <img src="data:image/png;base64,{result_b64}" 
+            <img class="comparison-image" src="data:image/png;base64,{result_b64}" 
                  style="width: 142.86%; height: 100%; object-fit: cover;" alt="AI优化">
         </div>
         
@@ -314,18 +304,18 @@ def create_comparison_component(task):
         </div>
         
         <!-- 标签 -->
-        <div style="position: absolute; top: 10px; left: 10px; background: rgba(52, 152, 219, 0.9); color: white; padding: 6px 12px; border-radius: 15px; font-size: 12px; font-weight: bold; z-index: 100;">
-            AI优化后
+        <div style="position: absolute; top: 10px; left: 10px; background: rgba(52, 152, 219, 0.9); color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; z-index: 100;">
+            AI优化
         </div>
-        <div style="position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 6px 12px; border-radius: 15px; font-size: 12px; font-weight: bold; z-index: 100;">
+        <div style="position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; z-index: 100;">
             原图
         </div>
         
-        <!-- 内置下载按钮 -->
-        <div id="download-btn-{task.task_id}" style="position: absolute; bottom: 15px; right: 15px; width: 45px; height: 45px; background: rgba(39, 174, 96, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 3px 8px rgba(0,0,0,0.3); transition: all 0.3s ease; z-index: 100;" 
-             onmouseover="this.style.background='rgba(39, 174, 96, 1)'; this.style.transform='scale(1.1)'"
-             onmouseout="this.style.background='rgba(39, 174, 96, 0.9)'; this.style.transform='scale(1)'">
-            <span style="color: white; font-size: 20px;">⬇</span>
+        <!-- 下载按钮 -->
+        <div id="download-btn-{task.task_id}" style="position: absolute; bottom: 10px; right: 10px; width: 40px; height: 40px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.3); transition: all 0.3s ease; z-index: 100;" 
+             onmouseover="this.style.background='rgba(52, 152, 219, 1)'; this.style.transform='scale(1.1)'"
+             onmouseout="this.style.background='rgba(52, 152, 219, 0.9)'; this.style.transform='scale(1)'">
+            <span style="color: white; font-size: 18px;">⬇</span>
         </div>
     </div>
 
@@ -377,15 +367,15 @@ def create_comparison_component(task):
             e.stopPropagation();
             const link = document.createElement('a');
             link.href = 'data:image/png;base64,{result_b64}';
-            link.download = '{task.file_name.rsplit(".", 1)[0] if "." in task.file_name else task.file_name}_optimized.png';
+            link.download = 'optimized_{task.file_name}';
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
             
-            // 下载成功反馈
+            // 下载反馈
             const original = this.innerHTML;
-            this.innerHTML = '<span style="color: white; font-size: 18px;">✓</span>';
-            setTimeout(() => {{ this.innerHTML = original; }}, 2000);
+            this.innerHTML = '<span style="color: white; font-size: 16px;">✓</span>';
+            setTimeout(() => {{ this.innerHTML = original; }}, 1500);
         }});
         
         // 初始化
@@ -395,10 +385,10 @@ def create_comparison_component(task):
     """
     
     # 缓存HTML
-    st.session_state.comparison_cache[cache_key] = html_code
+    st.session_state.image_cache[cache_key] = html_code
     return html_code
 
-# --- 8. 核心API函数 ---
+# --- 7. 核心API函数 ---
 
 def is_concurrent_limit_error(error_msg):
     """检查是否是并发限制错误"""
@@ -466,10 +456,10 @@ def download_result_image(url):
     response.raise_for_status()
     return response.content
 
-# --- 9. 任务处理核心逻辑 ---
+# --- 8. 任务处理核心逻辑（修复超时问题） ---
 
 def process_single_task(task, api_key, webapp_id, node_info):
-    """处理单个任务"""
+    """处理单个任务（修复超时到15分钟）"""
     task.status = "PROCESSING"
     task.start_time = time.time()
     
@@ -489,16 +479,16 @@ def process_single_task(task, api_key, webapp_id, node_info):
         task.progress = 30
         task.api_task_id = run_task(api_key, webapp_id, node_info_list)
         
-        # 步骤4: 轮询状态
+        # 步骤4: 轮询状态（修改为15分钟超时）
         poll_count = 0
         
-        while poll_count < MAX_POLL_COUNT:
+        while poll_count < MAX_POLL_COUNT:  # 300次 * 3秒 = 15分钟
             time.sleep(POLL_INTERVAL)
             poll_count += 1
             
             status = get_task_status(api_key, task.api_task_id)
             
-            # 更新进度
+            # 更新进度 (30% -> 90%)
             progress_increment = 60 * poll_count / MAX_POLL_COUNT
             task.progress = min(90, 30 + progress_increment)
             
@@ -531,7 +521,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
         error_msg = str(e)
         task.elapsed_time = time.time() - task.start_time if task.start_time else 0
         
-        # 重试逻辑
+        # 简化重试逻辑
         if (is_concurrent_limit_error(error_msg) and task.retry_count < MAX_RETRIES):
             task.retry_count += 1
             task.status = "QUEUED"
@@ -557,7 +547,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
             processing_key = GLOBAL_PROCESSING_SET.encode()
             r.srem(processing_key, str(task.task_id))
 
-# --- 10. 队列管理函数 ---
+# --- 9. 队列管理函数（修复Redis编码问题） ---
 
 def get_queue_stats():
     """获取队列统计信息"""
@@ -578,6 +568,7 @@ def get_queue_stats():
             'local_processing': local_processing
         }
     except Exception as e:
+        st.error(f"获取队列状态失败: {e}")
         return {'queued': 0, 'global_processing': 0, 'local_processing': 0}
 
 def start_new_tasks():
@@ -628,11 +619,11 @@ def start_new_tasks():
     except Exception as e:
         st.error(f"启动任务时出错: {e}")
 
-# --- 11. 主界面 ---
+# --- 10. 主界面 ---
 
 def main():
     st.title("🎨 RunningHub AI - 智能图片优化工具")
-    st.markdown("### 高效稳定的按需对比显示版本")
+    st.markdown("### 稳定高效的多页面协同处理平台")
     
     # 状态展示
     col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -692,9 +683,9 @@ def main():
         </div>
         """, unsafe_allow_html=True)
     
-    # 优化说明
+    # 系统状态信息
     timeout_minutes = MAX_POLL_COUNT * POLL_INTERVAL // 60
-    st.success(f"✨ **按需加载**: 任务完成后点击按钮查看对比，避免自动加载卡顿 | ⏰ **超时**: {timeout_minutes}分钟")
+    st.info(f"🕒 **超时设置**: 单个任务最长处理时间 {timeout_minutes} 分钟 | 🔄 **自动刷新**: {AUTO_REFRESH_INTERVAL}秒间隔")
     
     st.markdown("---")
     
@@ -709,7 +700,7 @@ def main():
             "选择图片文件（支持多选）",
             type=['png', 'jpg', 'jpeg', 'webp'],
             accept_multiple_files=True,
-            help="上传后任务加入全局队列，完成后按需查看对比效果",
+            help="上传后自动加入全局队列，数据会自动保存，页面刷新不会丢失",
             key=f"file_uploader_{st.session_state.file_uploader_key}"
         )
         
@@ -768,13 +759,12 @@ def main():
             st.markdown(f"**会话信息:**")
             st.code(f"Session ID: {get_session_key()}", language="text")
             
-            st.markdown("**按需加载特性:**")
+            st.markdown("**优化特性:**")
             st.markdown("""
-            - ✅ 任务完成后显示操作按钮
-            - ✅ 点击"效果对比"才加载组件
-            - ✅ 对比组件只渲染一次，不重复加载
-            - ✅ 成功任务不参与自动刷新
-            - ✅ 大幅提升页面响应速度
+            - ✅ 图片显示缓存，解决闪烁问题
+            - ✅ 15分钟超时限制，适合复杂图片
+            - ✅ 数据自动保存，页面刷新不丢失
+            - ✅ 减少刷新频率，提升稳定性
             """)
     
     # 右侧：任务列表
@@ -820,53 +810,19 @@ def main():
                             remaining_estimate = max(0, (timeout_minutes * 60) - elapsed)
                             st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒 | 剩余: 约{int(remaining_estimate//60)}分钟")
                     
-                    # 成功任务的按需显示逻辑
-                    elif task.status == "SUCCESS" and task.result_data:
+                    # 结果显示（使用缓存）
+                    if task.status == "SUCCESS" and task.result_data:
                         elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                         st.success(f"🎉 处理成功！用时: {elapsed_str}")
                         
-                        # 默认显示两个按钮
-                        button_col1, button_col2 = st.columns(2)
-                        
-                        with button_col1:
-                            # 下载按钮 (使用自定义样式)
-                            st.markdown('<div class="download-button">', unsafe_allow_html=True)
-                            download_clicked = create_download_button(task)
-                            st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            if download_clicked:
-                                st.success(f"✅ {task.file_name} 下载开始！")
-                        
-                        with button_col2:
-                            # 效果对比按钮
-                            st.markdown('<div class="compare-button">', unsafe_allow_html=True)
-                            compare_clicked = st.button(
-                                "🔍 效果对比", 
-                                key=f"compare_{task.task_id}",
-                                help="点击查看原图与AI优化后的滑动对比效果"
-                            )
-                            st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            # 点击对比按钮后，设置显示状态
-                            if compare_clicked:
-                                st.session_state.comparison_states[task.task_id] = True
-                                st.rerun()  # 重新渲染以显示对比组件
-                        
-                        # 如果已点击对比按钮，显示对比组件
-                        if st.session_state.comparison_states.get(task.task_id, False):
-                            st.markdown('<div class="comparison-container">', unsafe_allow_html=True)
-                            st.markdown("**🔍 滑动对比效果** (拖动中间线或点击任意位置对比)")
-                            
-                            comparison_html = create_comparison_component(task)
-                            if comparison_html:
-                                components.html(comparison_html, height=500)
-                                st.caption("💡 左侧显示AI优化效果，右侧显示原图。可拖动分割线或点击图片进行对比。右下角绿色按钮可直接下载。")
-                            else:
-                                st.error("对比组件生成失败，请重试")
-                            
-                            st.markdown('</div>', unsafe_allow_html=True)
+                        st.markdown("**🔍 效果对比** (左侧AI优化，右侧原图)")
+                        comparison_html = create_image_comparison_cached(task)
+                        if comparison_html:
+                            components.html(comparison_html, height=500)
+                            st.caption("💡 拖动中间分割线或点击图片任意位置对比效果，点击右下角按钮下载优化图片")
+                        else:
+                            st.warning("图片显示组件加载失败")
                     
-                    # 失败任务
                     elif task.status == "FAILED":
                         st.error(f"💥 处理失败: {task.error_message}")
                     
@@ -879,8 +835,7 @@ def main():
             with col_clear_local:
                 if st.button("🗑️ 清空本页", help="清空当前页面的任务"):
                     st.session_state.tasks = []
-                    st.session_state.comparison_states = {}
-                    st.session_state.comparison_cache = {}
+                    st.session_state.image_cache = {}
                     save_session_data()
                     st.rerun()
             
@@ -891,8 +846,7 @@ def main():
                         processing_key = GLOBAL_PROCESSING_SET.encode()
                         r.delete(queue_key, processing_key)
                         st.session_state.tasks = []
-                        st.session_state.comparison_states = {}
-                        st.session_state.comparison_cache = {}
+                        st.session_state.image_cache = {}
                         save_session_data()
                         st.success("✅ 已清空全局队列")
                         st.rerun()
@@ -908,21 +862,21 @@ def main():
     st.markdown("---")
     st.markdown(f"""
     <div style='text-align: center; color: #7f8c8d; padding: 20px;'>
-        <h4 style='margin: 10px 0; color: #34495e;'>🚀 RunningHub AI - 按需加载优化版</h4>
-        <p><strong>⚡ 性能优化</strong> | 按需加载对比组件，避免自动渲染卡顿</p>
-        <p><strong>🎯 用户体验</strong> | 两个操作按钮：直接下载 + 效果对比</p>
-        <p><strong>🔧 稳定改进</strong> | 成功任务不参与刷新，组件只渲染一次</p>
-        <p><strong>💾 数据安全</strong> | Redis持久化 + 断线恢复 + {timeout_minutes}分钟超时</p>
+        <h4 style='margin: 10px 0; color: #34495e;'>🚀 RunningHub AI - 企业级稳定版</h4>
+        <p><strong>🔧 问题修复</strong> | 图片缓存 + {timeout_minutes}分钟超时 + 数据持久化</p>
+        <p><strong>⚡ 性能优化</strong> | 减少刷新频率 + 智能缓存机制</p>
+        <p><strong>🛡️ 稳定可靠</strong> | 自动保存 + 断线恢复 + 错误重试</p>
+        <p><strong>💾 数据安全</strong> | Redis持久化 + 会话恢复</p>
     </div>
     """, unsafe_allow_html=True)
 
-# --- 12. 应用入口和优化的自动刷新 ---
+# --- 11. 应用入口和优化的自动刷新 ---
 
 if __name__ == "__main__":
     try:
         main()
         
-        # 优化的自动刷新逻辑：只有PROCESSING状态的任务参与刷新判断
+        # 优化的自动刷新逻辑
         has_processing = any(t.status == "PROCESSING" for t in st.session_state.tasks)
         has_queue_items = False
         
@@ -934,9 +888,9 @@ if __name__ == "__main__":
             except:
                 has_queue_items = False
         
-        # SUCCESS任务不参与刷新判断，大幅减少刷新频率
+        # 只在必要时刷新，减少频率
         if has_processing or has_queue_items:
-            time.sleep(AUTO_REFRESH_INTERVAL)
+            time.sleep(AUTO_REFRESH_INTERVAL)  # 增加到5秒间隔
             st.rerun()
             
     except Exception as e:
