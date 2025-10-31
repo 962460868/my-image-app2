@@ -48,7 +48,9 @@ MAX_GLOBAL_CONCURRENT = 5  # API总并发限制
 MAX_LOCAL_CONCURRENT = 3   # 单个网页并发限制
 MAX_RETRIES = 3            # 最大重试次数
 POLL_INTERVAL = 3          # 轮询间隔
-MAX_POLL_COUNT = 300       # 最大轮询次数 (300*3秒=15分钟)
+MAX_POLL_COUNT = 300       # 最大轮询次数 (300*3秒=15分钟) - 实际容错时间
+DISPLAY_TIMEOUT_MINUTES = 3  # 显示给用户的预计时间（分钟）
+ACTUAL_TIMEOUT_MINUTES = 15  # 实际超时时间（分钟）
 AUTO_REFRESH_INTERVAL = 5  # 增加自动刷新间隔，减少刷新频率
 
 # Redis键名
@@ -95,26 +97,58 @@ st.markdown("""
     .processing-badge { color: #f39c12; font-weight: bold; }
     .info-badge { color: #17a2b8; font-weight: bold; }
     .waiting-badge { color: #9b59b6; font-weight: bold; }
-    .metric-container {
-        background: white;
-        padding: 1rem;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        text-align: center;
-        border: 1px solid #e1e8ed;
-    }
-    .local-processing {
-        color: #e67e22;
-        font-weight: bold;
-    }
-    .global-processing {
-        color: #8e44ad;
-        font-weight: bold;
-    }
+    
     /* 修复图片显示闪烁 */
     .comparison-image {
         transition: none !important;
         image-rendering: -webkit-optimize-contrast;
+    }
+    
+    /* 图片占位符样式 */
+    .image-placeholder {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 18px;
+        font-weight: bold;
+        animation: pulse 2s ease-in-out infinite;
+        height: 500px;
+        width: 100%;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 0.6; }
+        50% { opacity: 1; }
+    }
+    
+    /* 统计数据容器 */
+    .stats-container {
+        background: white;
+        border-radius: 10px;
+        padding: 15px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        margin-bottom: 15px;
+    }
+    .stat-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 0;
+        border-bottom: 1px solid #f0f0f0;
+        align-items: center;
+    }
+    .stat-row:last-child {
+        border-bottom: none;
+    }
+    .stat-label {
+        color: #7f8c8d;
+        font-size: 14px;
+    }
+    .stat-value {
+        font-weight: bold;
+        font-size: 16px;
+        color: #2c3e50;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -262,7 +296,31 @@ class TaskItem:
             'retry_count': self.retry_count
         }
 
-# --- 6. 图片对比组件（优化缓存版） ---
+# --- 6. 图片对比组件（优化缓存版，添加占位符） ---
+
+def create_image_placeholder(task):
+    """创建图片占位符"""
+    cache_key = f"placeholder_{task.task_id}"
+    
+    # 检查是否已缓存
+    if cache_key in st.session_state.image_cache:
+        return st.session_state.image_cache[cache_key]
+    
+    html_code = f"""
+    <div style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; height: 500px;">
+        <div class="image-placeholder">
+            <div style="text-align: center;">
+                <div style="font-size: 48px; margin-bottom: 20px;">⚡</div>
+                <div style="font-size: 24px; margin-bottom: 10px;">AI处理中...</div>
+                <div style="font-size: 16px; opacity: 0.8;">预计需要 3 分钟</div>
+            </div>
+        </div>
+    </div>
+    """
+    
+    # 缓存HTML
+    st.session_state.image_cache[cache_key] = html_code
+    return html_code
 
 def create_image_comparison_cached(task):
     """创建缓存优化的图片对比组件"""
@@ -284,15 +342,15 @@ def create_image_comparison_cached(task):
         return st.session_state.image_cache[cache_key]
     
     html_code = f"""
-    <div id="comparison-container-{task.task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+    <div id="comparison-container-{task.task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15); height: 500px;">
         <!-- 原图背景 -->
         <img class="comparison-image" id="original-{task.task_id}" src="data:image/png;base64,{original_b64}" 
-             style="width: 100%; height: auto; display: block;" alt="原图">
+             style="width: 100%; height: 100%; display: block; object-fit: contain; position: absolute; top: 0; left: 0;" alt="原图">
         
         <!-- 结果图遮罩 -->
         <div id="result-overlay-{task.task_id}" style="position: absolute; top: 0; left: 0; width: 70%; height: 100%; overflow: hidden;">
             <img class="comparison-image" src="data:image/png;base64,{result_b64}" 
-                 style="width: 142.86%; height: 100%; object-fit: cover;" alt="AI优化">
+                 style="width: 142.86%; height: 100%; object-fit: contain; position: absolute; top: 0; left: 0;" alt="AI优化">
         </div>
         
         <!-- 分割线 -->
@@ -459,7 +517,7 @@ def download_result_image(url):
 # --- 8. 任务处理核心逻辑（修复超时问题） ---
 
 def process_single_task(task, api_key, webapp_id, node_info):
-    """处理单个任务（修复超时到15分钟）"""
+    """处理单个任务（显示3分钟，实际15分钟容错）"""
     task.status = "PROCESSING"
     task.start_time = time.time()
     
@@ -479,17 +537,23 @@ def process_single_task(task, api_key, webapp_id, node_info):
         task.progress = 30
         task.api_task_id = run_task(api_key, webapp_id, node_info_list)
         
-        # 步骤4: 轮询状态（修改为15分钟超时）
+        # 步骤4: 轮询状态（实际15分钟超时，但显示3分钟倒计时）
         poll_count = 0
+        display_timeout_seconds = DISPLAY_TIMEOUT_MINUTES * 60  # 3分钟 = 180秒
         
-        while poll_count < MAX_POLL_COUNT:  # 300次 * 3秒 = 15分钟
+        while poll_count < MAX_POLL_COUNT:  # 300次 * 3秒 = 15分钟实际容错
             time.sleep(POLL_INTERVAL)
             poll_count += 1
             
             status = get_task_status(api_key, task.api_task_id)
             
             # 更新进度 (30% -> 90%)
-            progress_increment = 60 * poll_count / MAX_POLL_COUNT
+            # 在前3分钟内显示正常进度，之后保持在90%
+            elapsed_time = poll_count * POLL_INTERVAL
+            if elapsed_time <= display_timeout_seconds:
+                progress_increment = 60 * elapsed_time / display_timeout_seconds
+            else:
+                progress_increment = 60  # 保持在90%
             task.progress = min(90, 30 + progress_increment)
             
             if status == "SUCCESS":
@@ -502,7 +566,7 @@ def process_single_task(task, api_key, webapp_id, node_info):
                 save_session_data()
         
         if poll_count >= MAX_POLL_COUNT:
-            raise Exception(f"任务处理超时 (超过{MAX_POLL_COUNT * POLL_INTERVAL // 60}分钟)")
+            raise Exception(f"任务处理超时 (超过{ACTUAL_TIMEOUT_MINUTES}分钟)")
         
         # 步骤5: 获取和下载结果
         task.progress = 95
@@ -625,70 +689,6 @@ def main():
     st.title("🎨 RunningHub AI - 智能图片优化工具")
     st.markdown("### 稳定高效的多页面协同处理平台")
     
-    # 状态展示
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
-    stats = get_queue_stats()
-    local_stats = {
-        'success': sum(1 for t in st.session_state.tasks if t.status == "SUCCESS"),
-        'failed': sum(1 for t in st.session_state.tasks if t.status == "FAILED"),
-        'total': len(st.session_state.tasks)
-    }
-    
-    with col1:
-        st.markdown(f"""
-        <div class="metric-container">
-            <h3 style="margin:0; color:#3498db;">{stats['queued']}</h3>
-            <p style="margin:0; color:#7f8c8d;">全局队列</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown(f"""
-        <div class="metric-container">
-            <h3 style="margin:0; color:#8e44ad;">{stats['global_processing']}/{MAX_GLOBAL_CONCURRENT}</h3>
-            <p style="margin:0; color:#7f8c8d;">API总并发</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown(f"""
-        <div class="metric-container">
-            <h3 style="margin:0; color:#e67e22;">{stats['local_processing']}/{MAX_LOCAL_CONCURRENT}</h3>
-            <p style="margin:0; color:#7f8c8d;">本页处理</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        st.markdown(f"""
-        <div class="metric-container">
-            <h3 style="margin:0; color:#27ae60;">{local_stats['success']}</h3>
-            <p style="margin:0; color:#7f8c8d;">已完成</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col5:
-        st.markdown(f"""
-        <div class="metric-container">
-            <h3 style="margin:0; color:#e74c3c;">{local_stats['failed']}</h3>
-            <p style="margin:0; color:#7f8c8d;">失败</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col6:
-        st.markdown(f"""
-        <div class="metric-container">
-            <h3 style="margin:0; color:#9b59b6;">{local_stats['total']}</h3>
-            <p style="margin:0; color:#7f8c8d;">本页总数</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # 系统状态信息
-    timeout_minutes = MAX_POLL_COUNT * POLL_INTERVAL // 60
-    st.info(f"🕒 **超时设置**: 单个任务最长处理时间 {timeout_minutes} 分钟 | 🔄 **自动刷新**: {AUTO_REFRESH_INTERVAL}秒间隔")
-    
-    st.markdown("---")
-    
     # 主界面布局
     left_col, right_col = st.columns([2, 3])
     
@@ -732,7 +732,7 @@ def main():
                     # 保存会话数据
                     save_session_data()
                     
-                    st.success(f"✅ 已添加 {len(uploaded_files)} 个任务到全局队列！")
+                    st.success(f"✅ 已添加 {len(uploaded_files)} 个任务到全局队列!")
                     st.session_state.file_uploader_key += 1
                     time.sleep(0.5)
                     st.rerun()
@@ -741,6 +741,44 @@ def main():
                     st.error(f"❌ 添加任务失败: {e}")
         
         st.markdown("---")
+        
+        # 统计数据（折叠到左侧）
+        with st.expander("📊 系统统计", expanded=True):
+            stats = get_queue_stats()
+            local_stats = {
+                'success': sum(1 for t in st.session_state.tasks if t.status == "SUCCESS"),
+                'failed': sum(1 for t in st.session_state.tasks if t.status == "FAILED"),
+                'total': len(st.session_state.tasks)
+            }
+            
+            st.markdown(f"""
+            <div class="stats-container">
+                <div class="stat-row">
+                    <span class="stat-label">🌐 全局队列</span>
+                    <span class="stat-value" style="color: #3498db;">{stats['queued']}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">🔄 API总并发</span>
+                    <span class="stat-value" style="color: #8e44ad;">{stats['global_processing']}/{MAX_GLOBAL_CONCURRENT}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">⚡ 本页处理</span>
+                    <span class="stat-value" style="color: #e67e22;">{stats['local_processing']}/{MAX_LOCAL_CONCURRENT}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">✅ 已完成</span>
+                    <span class="stat-value" style="color: #27ae60;">{local_stats['success']}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">❌ 失败</span>
+                    <span class="stat-value" style="color: #e74c3c;">{local_stats['failed']}</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">📋 本页总数</span>
+                    <span class="stat-value" style="color: #9b59b6;">{local_stats['total']}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
         
         # 系统信息
         with st.expander("⚙️ 系统配置", expanded=False):
@@ -751,8 +789,9 @@ def main():
             
             st.markdown("**系统配置:**")
             st.info(f"🌐 API总并发: {MAX_GLOBAL_CONCURRENT}")
-            st.info(f"📄 单页并发: {MAX_LOCAL_CONCURRENT}")
-            st.info(f"⏰ 单任务超时: {timeout_minutes}分钟")
+            st.info(f"🔄 单页并发: {MAX_LOCAL_CONCURRENT}")
+            st.info(f"⏰ 预计时间: {DISPLAY_TIMEOUT_MINUTES}分钟")
+            st.info(f"🛡️ 容错时间: {ACTUAL_TIMEOUT_MINUTES}分钟")
             st.info(f"🔁 最大重试: {MAX_RETRIES}次")
             st.info(f"🔄 自动刷新: {AUTO_REFRESH_INTERVAL}秒")
             
@@ -761,10 +800,11 @@ def main():
             
             st.markdown("**优化特性:**")
             st.markdown("""
+            - ✅ 预留图片UI，处理中即可查看
             - ✅ 图片显示缓存，解决闪烁问题
-            - ✅ 15分钟超时限制，适合复杂图片
+            - ✅ 3分钟倒计时，15分钟容错
             - ✅ 数据自动保存，页面刷新不丢失
-            - ✅ 减少刷新频率，提升稳定性
+            - ✅ 统计数据折叠显示，界面更整洁
             """)
     
     # 右侧：任务列表
@@ -800,31 +840,44 @@ def main():
                         else:
                             st.markdown('<span class="info-badge">⏳ 队列中</span>', unsafe_allow_html=True)
                     
-                    # 进度显示
+                    # 进度显示（基于3分钟显示）
                     if task.status == "PROCESSING":
                         st.progress(task.progress / 100)
                         st.caption(f"进度: {int(task.progress)}%")
                         
                         if task.start_time:
                             elapsed = time.time() - task.start_time
-                            remaining_estimate = max(0, (timeout_minutes * 60) - elapsed)
-                            st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒 | 剩余: 约{int(remaining_estimate//60)}分钟")
+                            display_timeout_seconds = DISPLAY_TIMEOUT_MINUTES * 60
+                            
+                            # 显示基于3分钟的倒计时
+                            if elapsed <= display_timeout_seconds:
+                                remaining_display = max(0, display_timeout_seconds - elapsed)
+                                st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒 | 预计剩余: {int(remaining_display//60)}分{int(remaining_display%60)}秒")
+                            else:
+                                # 超过3分钟后，显示正在处理中（不显示15分钟倒计时）
+                                st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒 | 正在处理中...")
                     
-                    # 结果显示（使用缓存）
+                    # 图片对比区域 - 预留UI
+                    st.markdown("**🔍 效果对比** (左侧AI优化，右侧原图)")
+                    
                     if task.status == "SUCCESS" and task.result_data:
+                        # 显示实际对比
                         elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                         st.success(f"🎉 处理成功！用时: {elapsed_str}")
                         
-                        st.markdown("**🔍 效果对比** (左侧AI优化，右侧原图)")
                         comparison_html = create_image_comparison_cached(task)
                         if comparison_html:
                             components.html(comparison_html, height=500)
                             st.caption("💡 拖动中间分割线或点击图片任意位置对比效果，点击右下角按钮下载优化图片")
                         else:
                             st.warning("图片显示组件加载失败")
-                    
-                    elif task.status == "FAILED":
-                        st.error(f"💥 处理失败: {task.error_message}")
+                    else:
+                        # 显示占位符
+                        placeholder_html = create_image_placeholder(task)
+                        components.html(placeholder_html, height=500)
+                        
+                        if task.status == "FAILED":
+                            st.error(f"💥 处理失败: {task.error_message}")
                     
                     st.markdown('</div>', unsafe_allow_html=True)
                     st.markdown("---")
@@ -863,8 +916,8 @@ def main():
     st.markdown(f"""
     <div style='text-align: center; color: #7f8c8d; padding: 20px;'>
         <h4 style='margin: 10px 0; color: #34495e;'>🚀 RunningHub AI - 企业级稳定版</h4>
-        <p><strong>🔧 问题修复</strong> | 图片缓存 + {timeout_minutes}分钟超时 + 数据持久化</p>
-        <p><strong>⚡ 性能优化</strong> | 减少刷新频率 + 智能缓存机制</p>
+        <p><strong>🔧 问题修复</strong> | 预留UI占位 + {DISPLAY_TIMEOUT_MINUTES}分钟倒计时 + {ACTUAL_TIMEOUT_MINUTES}分钟容错</p>
+        <p><strong>⚡ 性能优化</strong> | 统计数据折叠 + 图片缓存防闪烁</p>
         <p><strong>🛡️ 稳定可靠</strong> | 自动保存 + 断线恢复 + 错误重试</p>
         <p><strong>💾 数据安全</strong> | Redis持久化 + 会话恢复</p>
     </div>
