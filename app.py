@@ -4,17 +4,16 @@ import time
 import io
 from PIL import Image
 from datetime import datetime
+import threading
 import base64
 import copy
 import json
 import random
 import streamlit.components.v1 as components
+import redis
+import logging
 import os
-import pickle
-from pathlib import Path
-import queue
-import threading
-from typing import Dict, Any, Optional
+from urllib.parse import urlparse
 
 # 页面配置
 st.set_page_config(
@@ -68,123 +67,38 @@ st.markdown("""
         color: #9b59b6;
         font-weight: bold;
     }
+    .token-waiting-badge {
+        color: #ff6b6b;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# 配置常量
-MAX_GLOBAL_CONCURRENT = 5  # 全局最大并发数
-MAX_LOCAL_CONCURRENT = 3   # 单用户最大并发数
-API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
-WEBAPP_ID = "1947599512657453057"
-NODE_INFO = [
-    {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
-    {"nodeId": "60", "fieldName": "text", "fieldValue": "8k, high quality, high detail", "description": "正向提示词补充"},
-    {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
-]
+# Redis配置 - 从环境变量读取
+def get_redis_config():
+    """从环境变量获取Redis配置"""
+    redis_url = os.getenv('REDIS_URL')
+    if redis_url:
+        # 解析Redis URL
+        parsed = urlparse(redis_url)
+        return {
+            'host': parsed.hostname,
+            'port': parsed.port or 6379,
+            'password': parsed.password,
+            'db': 0
+        }
+    else:
+        # 从单独的环境变量读取
+        return {
+            'host': os.getenv('REDIS_HOST', 'localhost'),
+            'port': int(os.getenv('REDIS_PORT', 6379)),
+            'password': os.getenv('REDIS_PASSWORD'),
+            'db': int(os.getenv('REDIS_DB', 0))
+        }
 
-# 全局状态文件路径
-GLOBAL_STATE_DIR = Path("./streamlit_global_state")
-GLOBAL_STATE_DIR.mkdir(exist_ok=True)
-GLOBAL_CONCURRENT_FILE = GLOBAL_STATE_DIR / "concurrent_count.pkl"
-GLOBAL_LOCK_FILE = GLOBAL_STATE_DIR / "global.lock"
-
-# API并发限制相关的错误关键词
-CONCURRENT_LIMIT_ERRORS = [
-    "concurrent limit", "too many requests", "rate limit", "队列已满", 
-    "并发限制", "服务忙碌", "CONCURRENT_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"
-]
-
-class SimpleFileLock:
-    """简单的文件锁实现 - 兼容 Windows 和 Unix"""
-    def __init__(self, lock_file: Path):
-        self.lock_file = lock_file
-        
-    def __enter__(self):
-        # 简单的基于文件存在的锁机制
-        max_wait = 10  # 最多等待10秒
-        wait_time = 0
-        
-        while self.lock_file.exists() and wait_time < max_wait:
-            time.sleep(0.1)
-            wait_time += 0.1
-            
-        # 创建锁文件
-        try:
-            self.lock_file.touch()
-        except FileExistsError:
-            pass  # 如果文件已存在，继续执行
-        
-        return self
-        
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # 删除锁文件
-        try:
-            if self.lock_file.exists():
-                self.lock_file.unlink()
-        except:
-            pass
-
-class GlobalConcurrencyManager:
-    """全局并发管理器 - 跨进程同步"""
-    
-    def __init__(self, max_concurrent=MAX_GLOBAL_CONCURRENT):
-        self.max_concurrent = max_concurrent
-        self.state_file = GLOBAL_CONCURRENT_FILE
-        self.lock = SimpleFileLock(GLOBAL_LOCK_FILE)
-        
-    def _read_state(self) -> Dict[str, float]:
-        """读取全局状态"""
-        try:
-            if self.state_file.exists():
-                with open(self.state_file, 'rb') as f:
-                    data = pickle.load(f)
-                    # 清理超过5分钟的旧记录
-                    current_time = time.time()
-                    data = {k: v for k, v in data.items() if current_time - v < 300}
-                    return data
-        except Exception:
-            pass
-        return {}
-    
-    def _write_state(self, data: Dict[str, float]):
-        """写入全局状态"""
-        try:
-            with open(self.state_file, 'wb') as f:
-                pickle.dump(data, f)
-        except Exception:
-            pass
-    
-    def acquire_slot(self, session_id: str) -> bool:
-        """尝试获取全局槽位"""
-        with self.lock:
-            current_tasks = self._read_state()
-            active_count = len(current_tasks)
-            
-            if active_count < self.max_concurrent:
-                current_tasks[session_id] = time.time()
-                self._write_state(current_tasks)
-                return True
-            return False
-    
-    def release_slot(self, session_id: str):
-        """释放全局槽位"""
-        with self.lock:
-            current_tasks = self._read_state()
-            if session_id in current_tasks:
-                del current_tasks[session_id]
-                self._write_state(current_tasks)
-    
-    def get_status(self) -> tuple[int, int]:
-        """获取全局状态"""
-        try:
-            with self.lock:
-                current_tasks = self._read_state()
-                return len(current_tasks), self.max_concurrent
-        except:
-            return 0, self.max_concurrent
-
-# 全局管理器
-global_manager = GlobalConcurrencyManager()
+REDIS_CONFIG = get_redis_config()
+TOKEN_BUCKET_KEY = "ai_processing_tokens"  # Redis中令牌桶的键名
+GLOBAL_CONCURRENT_LIMIT = 5  # 全局并发限制
 
 # 初始化 session_state
 if 'tasks' not in st.session_state:
@@ -193,261 +107,133 @@ if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
-if 'session_id' not in st.session_state:
-    st.session_state.session_id = f"session_{int(time.time()*1000)}_{random.randint(1000,9999)}"
-if 'task_queue' not in st.session_state:
-    st.session_state.task_queue = queue.Queue()
-if 'running_tasks' not in st.session_state:
-    st.session_state.running_tasks = {}
+if 'redis_client' not in st.session_state:
+    st.session_state.redis_client = None
+
+# 配置常量
+API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
+WEBAPP_ID = "1947599512657453057"
+NODE_INFO = [
+    {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
+    {"nodeId": "60", "fieldName": "text", "fieldValue": "8k, high quality, high detail", "description": "正向提示词补充"},
+    {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
+]
+
+# API并发限制相关的错误关键词
+CONCURRENT_LIMIT_ERRORS = [
+    "concurrent limit",
+    "too many requests",
+    "rate limit",
+    "队列已满",
+    "并发限制",
+    "服务忙碌",
+    "CONCURRENT_LIMIT_EXCEEDED",
+    "TOO_MANY_REQUESTS"
+]
+
+class RedisTokenManager:
+    """Redis令牌桶管理器"""
+    
+    def __init__(self, redis_client, bucket_key, max_tokens):
+        self.redis_client = redis_client
+        self.bucket_key = bucket_key
+        self.max_tokens = max_tokens
+        self.init_tokens()
+    
+    def init_tokens(self):
+        """初始化令牌桶"""
+        try:
+            # 检查令牌桶是否已存在
+            current_tokens = self.redis_client.llen(self.bucket_key)
+            
+            if current_tokens == 0:
+                # 如果令牌桶为空，初始化令牌
+                for i in range(self.max_tokens):
+                    token_id = f"token_{i+1}_{int(time.time())}"
+                    self.redis_client.lpush(self.bucket_key, token_id)
+                st.success(f"✅ 已初始化 {self.max_tokens} 个全局处理令牌")
+            else:
+                st.info(f"ℹ️ 发现现有令牌桶，当前可用令牌数：{current_tokens}")
+        except Exception as e:
+            st.error(f"❌ 初始化令牌桶失败：{str(e)}")
+    
+    def acquire_token(self, timeout=0):
+        """获取令牌（阻塞操作）"""
+        try:
+            if timeout > 0:
+                result = self.redis_client.brpop(self.bucket_key, timeout=timeout)
+            else:
+                result = self.redis_client.brpop(self.bucket_key, timeout=0)
+            
+            if result:
+                return result[1].decode('utf-8')  # 返回令牌ID
+            return None
+        except Exception as e:
+            logging.error(f"获取令牌失败：{str(e)}")
+            return None
+    
+    def release_token(self, token_id):
+        """释放令牌"""
+        try:
+            self.redis_client.lpush(self.bucket_key, token_id)
+            return True
+        except Exception as e:
+            logging.error(f"释放令牌失败：{str(e)}")
+            return False
+    
+    def get_available_tokens(self):
+        """获取当前可用令牌数量"""
+        try:
+            return self.redis_client.llen(self.bucket_key)
+        except:
+            return 0
+    
+    def get_processing_count(self):
+        """获取当前处理中的任务数量"""
+        return max(0, self.max_tokens - self.get_available_tokens())
+
+@st.cache_resource
+def get_redis_client():
+    """获取Redis连接（使用Streamlit缓存）"""
+    try:
+        client = redis.Redis(
+            host=REDIS_CONFIG['host'],
+            port=REDIS_CONFIG['port'],
+            password=REDIS_CONFIG['password'],
+            db=REDIS_CONFIG['db'],
+            decode_responses=False,  # 手动处理编码
+            socket_timeout=10,
+            socket_connect_timeout=10,
+            retry_on_timeout=True,
+            health_check_interval=30
+        )
+        # 测试连接
+        client.ping()
+        return client
+    except Exception as e:
+        st.error(f"❌ Redis连接失败：{str(e)}")
+        st.error(f"配置信息: {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
+        return None
 
 class TaskItem:
     """任务项类"""
-    def __init__(self, task_id: int, file_data: bytes, file_name: str):
+    def __init__(self, task_id, file_data, file_name):
         self.task_id = task_id
         self.file_data = file_data
         self.file_name = file_name
         self.status = "QUEUED"
         self.progress = 0
-        self.result_url: Optional[str] = None
-        self.result_data: Optional[bytes] = None
-        self.error_message: Optional[str] = None
-        self.api_task_id: Optional[str] = None
+        self.result_url = None
+        self.result_data = None
+        self.error_message = None
+        self.api_task_id = None
         self.created_at = datetime.now()
-        self.start_time: Optional[float] = None
-        self.elapsed_time: Optional[float] = None
-        self.retry_count = 0
-        self.max_retries = 10
-        self.global_session_key: Optional[str] = None
-
-class TaskProcessor:
-    """任务处理器 - 不依赖 Streamlit session"""
-    
-    @staticmethod
-    def upload_file(file_data: bytes, file_name: str, api_key: str) -> str:
-        """上传文件到服务器"""
-        url = 'https://www.runninghub.cn/task/openapi/upload'
-        files = {'file': (file_name, file_data)}
-        data = {'apiKey': api_key, 'fileType': 'image'}
-        
-        response = requests.post(url, files=files, data=data, timeout=60)
-        response.raise_for_status()
-        
-        response_data = response.json()
-        if response_data.get("code") == 0:
-            return response_data['data'] ['fileName']
-        else:
-            raise Exception(f"图片上传失败: {response_data.get('msg', '未知错误')}")
-    
-    @staticmethod
-    def run_task(api_key: str, webapp_id: str, node_info_list: list) -> str:
-        """发起任务"""
-        run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
-        headers = {'Content-Type': 'application/json'}
-        payload = {
-            "apiKey": api_key,
-            "webappId": webapp_id,
-            "nodeInfoList": node_info_list
-        }
-        
-        response = requests.post(run_url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        
-        run_data = response.json()
-        if run_data.get("code") != 0:
-            raise Exception(f"发起任务失败: {run_data.get('msg', '未知错误')}")
-        
-        return run_data['data'] ['taskId']
-    
-    @staticmethod
-    def get_task_status(api_key: str, task_id: str) -> str:
-        """获取任务状态"""
-        status_url = 'https://www.runninghub.cn/task/openapi/status'
-        response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return data.get('data', 'UNKNOWN')
-    
-    @staticmethod
-    def fetch_task_output(api_key: str, task_id: str) -> str:
-        """获取任务输出"""
-        output_url = 'https://www.runninghub.cn/task/openapi/outputs'
-        response = requests.post(output_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get("code") == 0 and data.get("data"):
-            file_url = data["data"] [0].get("fileUrl")
-            if file_url:
-                return file_url
-            else:
-                raise Exception("未找到图片URL")
-        else:
-            raise Exception(f"获取结果失败: {data.get('msg', '未知错误')}")
-    
-    @staticmethod
-    def download_result_image(url: str) -> bytes:
-        """下载结果图片"""
-        response = requests.get(url, stream=True, timeout=60)
-        response.raise_for_status()
-        return response.content
-
-    @staticmethod
-    def process_task(task: TaskItem, api_key: str, webapp_id: str, node_info: list, 
-                    progress_callback=None, global_manager=None) -> TaskItem:
-        """处理单个任务 - 纯数据处理，不依赖Streamlit"""
-        
-        def update_progress(progress: int, status: str = None):
-            if progress_callback:
-                progress_callback(task.task_id, progress, status)
-        
-        try:
-            # 生成全局会话键
-            task.global_session_key = f"{int(time.time())}_{task.task_id}_{random.randint(1000,9999)}"
-            
-            # 尝试获取全局槽位
-            if global_manager and not global_manager.acquire_slot(task.global_session_key):
-                task.status = "WAITING_GLOBAL"
-                task.error_message = "全局API并发已满，等待其他任务完成..."
-                update_progress(0, "WAITING_GLOBAL")
-                return task
-            
-            task.status = "UPLOADING"
-            task.start_time = time.time()
-            update_progress(5, "UPLOADING")
-            
-            # 步骤1: 上传文件
-            uploaded_filename = TaskProcessor.upload_file(task.file_data, task.file_name, api_key)
-            update_progress(15)
-            
-            # 步骤2: 准备节点信息
-            node_info_list = copy.deepcopy(node_info)
-            for node in node_info_list:
-                if node["nodeId"] == "38":
-                    node["fieldValue"] = uploaded_filename
-            
-            # 步骤3: 发起任务
-            task.api_task_id = TaskProcessor.run_task(api_key, webapp_id, node_info_list)
-            task.status = "PROCESSING"
-            update_progress(20, "PROCESSING")
-            
-            # 步骤4: 轮询状态
-            progress = 20
-            max_polls = 60
-            poll_count = 0
-            status = None
-            
-            while poll_count < max_polls:
-                time.sleep(3)
-                poll_count += 1
-                
-                status = TaskProcessor.get_task_status(api_key, task.api_task_id)
-                
-                if progress < 95:
-                    progress += min(2, (95 - progress) / 10)
-                    progress = int(progress)
-                
-                update_progress(progress)
-                
-                if status == "SUCCESS":
-                    break
-                elif status == "FAILED":
-                    raise Exception("任务处理失败")
-                elif status in ["QUEUED", "RUNNING"]:
-                    continue
-            
-            if poll_count >= max_polls:
-                raise Exception("任务处理超时")
-            
-            if status == "SUCCESS":
-                update_progress(95)
-                result_url = TaskProcessor.fetch_task_output(api_key, task.api_task_id)
-                task.result_url = result_url
-                
-                task.result_data = TaskProcessor.download_result_image(result_url)
-                task.progress = 100
-                task.status = "SUCCESS"
-                task.elapsed_time = time.time() - task.start_time
-                update_progress(100, "SUCCESS")
-            else:
-                raise Exception(f"任务未成功完成，最终状态: {status}")
-                
-        except Exception as e:
-            error_msg = str(e)
-            
-            # 检查是否是并发限制错误
-            if any(keyword in error_msg.lower() for keyword in CONCURRENT_LIMIT_ERRORS) and task.retry_count < task.max_retries:
-                task.status = "WAITING"
-                task.retry_count += 1
-                task.progress = 0
-                update_progress(0, "WAITING")
-                # 等待重试
-                wait_time = random.randint(2, 10)
-                time.sleep(wait_time)
-                task.status = "QUEUED"
-                update_progress(0, "QUEUED")
-            else:
-                task.status = "FAILED"
-                task.error_message = error_msg
-                task.elapsed_time = time.time() - task.start_time if task.start_time else 0
-                update_progress(0, "FAILED")
-        
-        finally:
-            # 释放全局槽位
-            if global_manager and task.global_session_key:
-                global_manager.release_slot(task.global_session_key)
-        
-        return task
-
-def start_task_processing():
-    """启动任务处理线程"""
-    def progress_callback(task_id: int, progress: int, status: str = None):
-        """进度回调 - 更新任务状态"""
-        for task in st.session_state.tasks:
-            if task.task_id == task_id:
-                task.progress = progress
-                if status:
-                    task.status = status
-                break
-    
-    def worker():
-        """工作线程函数"""
-        while True:
-            try:
-                # 获取任务
-                task_data = st.session_state.task_queue.get(timeout=1)
-                if task_data is None:  # 退出信号
-                    break
-                    
-                task = task_data
-                
-                # 处理任务
-                processed_task = TaskProcessor.process_task(
-                    task, API_KEY, WEBAPP_ID, NODE_INFO, 
-                    progress_callback, global_manager
-                )
-                
-                # 更新任务状态
-                for i, t in enumerate(st.session_state.tasks):
-                    if t.task_id == processed_task.task_id:
-                        st.session_state.tasks[i] = processed_task
-                        break
-                        
-                # 从运行中任务列表移除
-                if task.task_id in st.session_state.running_tasks:
-                    del st.session_state.running_tasks[task.task_id]
-                
-                st.session_state.task_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                st.error(f"任务处理出错: {e}")
-                st.session_state.task_queue.task_done()
-    
-    # 启动工作线程（如果还没有启动）
-    if 'worker_thread' not in st.session_state or not st.session_state.worker_thread.is_alive():
-        st.session_state.worker_thread = threading.Thread(target=worker, daemon=True)
-        st.session_state.worker_thread.start()
+        self.start_time = None
+        self.elapsed_time = None
+        self.retry_count = 0  # 重试次数
+        self.max_retries = 10  # 最大重试次数
+        self.token_id = None  # 当前持有的令牌ID
+        self.waiting_for_token = False  # 是否正在等待令牌
 
 def create_before_after_comparison(original_data, result_data, task_id):
     """创建原图与结果图的滑动对比组件"""
@@ -552,7 +338,6 @@ def create_before_after_comparison(original_data, result_data, task_id):
         if (downloadBtn) {{
             downloadBtn.addEventListener('click', function(e) {{
                 e.stopPropagation();
-                
                 const link = document.createElement('a');
                 link.href = 'data:image/png;base64,{result_b64}';
                 link.download = 'optimized_image.png';
@@ -587,15 +372,220 @@ def create_before_after_comparison(original_data, result_data, task_id):
     
     return html_code
 
-# 启动任务处理
-start_task_processing()
+def is_concurrent_limit_error(error_msg):
+    """检查是否是并发限制错误"""
+    error_msg_lower = error_msg.lower()
+    return any(keyword in error_msg_lower for keyword in CONCURRENT_LIMIT_ERRORS)
+
+def upload_file(file_data, file_name, api_key):
+    """上传文件到服务器"""
+    url = 'https://www.runninghub.cn/task/openapi/upload'
+    
+    files = {'file': (file_name, file_data)}
+    data = {'apiKey': api_key, 'fileType': 'image'}
+    
+    response = requests.post(url, files=files, data=data, timeout=60)
+    response.raise_for_status()
+    
+    response_data = response.json()
+    
+    if response_data.get("code") == 0:
+        uploaded_filename = response_data['data']['fileName']
+        return uploaded_filename
+    else:
+        error_msg = f"图片上传失败: {response_data.get('msg', '未知错误')}"
+        raise Exception(error_msg)
+
+def run_task(api_key, webapp_id, node_info_list):
+    """发起任务"""
+    run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
+    headers = {'Content-Type': 'application/json'}
+    payload = {
+        "apiKey": api_key,
+        "webappId": webapp_id,
+        "nodeInfoList": node_info_list
+    }
+    
+    response = requests.post(run_url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
+    
+    run_data = response.json()
+    
+    if run_data.get("code") != 0:
+        error_msg = f"发起任务失败: {run_data.get('msg', '未知错误')}"
+        raise Exception(error_msg)
+    
+    task_id = run_data['data']['taskId']
+    return task_id
+
+def fetch_task_output(api_key, task_id):
+    """获取任务输出"""
+    output_url = 'https://www.runninghub.cn/task/openapi/outputs'
+    
+    response = requests.post(output_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    
+    if data.get("code") == 0 and data.get("data"):
+        file_url = data["data"][0].get("fileUrl")
+        if file_url:
+            return file_url
+        else:
+            raise Exception("未找到图片URL")
+    else:
+        raise Exception(f"获取结果失败: {data.get('msg', '未知错误')}")
+
+def download_result_image(url):
+    """下载结果图片"""
+    response = requests.get(url, stream=True, timeout=60)
+    response.raise_for_status()
+    content = response.content
+    return content
+
+def process_single_task(task, api_key, webapp_id, node_info, token_manager):
+    """处理单个任务（含令牌管理）"""
+    token_id = None
+    try:
+        # 第一步：获取令牌（阻塞操作）
+        task.status = "WAITING_TOKEN"
+        task.waiting_for_token = True
+        
+        # 阻塞等待令牌，最多等待300秒（5分钟）
+        token_id = token_manager.acquire_token(timeout=300)
+        
+        if not token_id:
+            raise Exception("获取处理令牌超时，请稍后重试")
+        
+        task.token_id = token_id
+        task.waiting_for_token = False
+        task.status = "UPLOADING"
+        task.start_time = time.time()
+        task.progress = 5
+        
+        # 步骤2: 上传文件
+        uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
+        task.progress = 15
+        
+        # 步骤3: 准备节点信息
+        node_info_list = copy.deepcopy(node_info)
+        
+        # 更新图片节点
+        for node in node_info_list:
+            if node["nodeId"] == "38":
+                node["fieldValue"] = uploaded_filename
+        
+        # 步骤4: 发起任务
+        task.api_task_id = run_task(api_key, webapp_id, node_info_list)
+        task.status = "PROCESSING"
+        task.progress = 20
+        
+        # 步骤5: 轮询状态
+        progress = 20
+        max_polls = 60  # 最多轮询60次（约3分钟）
+        poll_count = 0
+        status = None
+        
+        while poll_count < max_polls:
+            time.sleep(3)  # 每3秒轮询一次
+            poll_count += 1
+            
+            status_url = 'https://www.runninghub.cn/task/openapi/status'
+            response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task.api_task_id}, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            status = data.get('data')
+            
+            # 缓慢增长进度条：从20%到95%
+            if progress < 95:
+                progress += min(2, (95 - progress) / 10)  # 越接近95%增长越慢
+                progress = int(progress)
+            
+            task.progress = progress
+            
+            if status == "SUCCESS":
+                break
+            elif status == "FAILED":
+                raise Exception("任务处理失败")
+            elif status in ["QUEUED", "RUNNING"]:
+                # 继续等待
+                continue
+            else:
+                continue
+        
+        # 检查是否超时
+        if poll_count >= max_polls:
+            raise Exception("任务处理超时")
+        
+        # 只有在状态为SUCCESS时才获取结果
+        if status == "SUCCESS":
+            # 步骤6: 获取结果
+            task.progress = 95
+            result_url = fetch_task_output(api_key, task.api_task_id)
+            task.result_url = result_url
+            
+            # 步骤7: 下载结果
+            task.result_data = download_result_image(result_url)
+            task.progress = 100
+            task.status = "SUCCESS"
+            task.elapsed_time = time.time() - task.start_time
+        else:
+            raise Exception(f"任务未成功完成，最终状态: {status}")
+            
+    except Exception as e:
+        error_msg = str(e)
+        
+        # 检查是否是并发限制错误
+        if is_concurrent_limit_error(error_msg) and task.retry_count < task.max_retries:
+            # 并发限制错误，回到队列等待重试
+            task.status = "WAITING"  # 新状态：等待重试
+            task.retry_count += 1
+            task.progress = 0
+            # 随机等待2-10秒后重试，避免所有任务同时重试
+            wait_time = random.randint(2, 10)
+            time.sleep(wait_time)
+            task.status = "QUEUED"  # 重新排队
+        else:
+            # 其他错误或超过最大重试次数
+            task.status = "FAILED"
+            task.error_message = error_msg
+            task.elapsed_time = time.time() - task.start_time if task.start_time else 0
+    finally:
+        # 确保释放令牌
+        if token_id:
+            token_manager.release_token(token_id)
+            task.token_id = None
+        task.waiting_for_token = False
+
+# 初始化Redis连接和令牌管理器
+redis_client = get_redis_client()
+
+if redis_client:
+    if 'token_manager' not in st.session_state:
+        st.session_state.token_manager = RedisTokenManager(
+            redis_client, 
+            TOKEN_BUCKET_KEY, 
+            GLOBAL_CONCURRENT_LIMIT
+        )
 
 # 主界面
-st.title("🎨 RunningHub AI - 智能图片优化工具")
-st.markdown("### 专业的AI图片优化和增强服务")
+st.title("🎨 RunningHub AI - 智能图片优化工具（Redis分布式版）")
+st.markdown("### 专业的AI图片优化和增强服务 - 支持多实例水平扩容")
 
-# 获取全局状态
-global_current, global_max = global_manager.get_status()
+# Redis连接状态
+if redis_client:
+    st.success("✅ Redis连接正常")
+    
+    # 获取令牌状态
+    if 'token_manager' in st.session_state:
+        available_tokens = st.session_state.token_manager.get_available_tokens()
+        processing_count = st.session_state.token_manager.get_processing_count()
+    else:
+        available_tokens = 0
+        processing_count = 0
+else:
+    st.error("❌ Redis连接失败，无法使用分布式并发控制")
+    st.error("请检查环境变量配置")
+    st.stop()
 
 # 统计信息
 col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -603,14 +593,13 @@ with col1:
     queued = sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
     st.metric("队列中", queued)
 with col2:
-    processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
-    st.metric("处理中", processing)
+    waiting_token = sum(1 for t in st.session_state.tasks if t.status == "WAITING_TOKEN")
+    st.metric("等待令牌", waiting_token)
 with col3:
-    waiting_global = sum(1 for t in st.session_state.tasks if t.status == "WAITING_GLOBAL")
-    st.metric("等待全局槽位", waiting_global)
+    processing_local = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
+    st.metric(f"本地处理中", processing_local)
 with col4:
-    waiting = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
-    st.metric("等待重试", waiting)
+    st.metric(f"全局处理中", f"{processing_count}/{GLOBAL_CONCURRENT_LIMIT}")
 with col5:
     completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
     st.metric("已完成", completed)
@@ -618,8 +607,12 @@ with col6:
     failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
     st.metric("失败", failed)
 
-# 全局并发状态
-st.info(f"🌐 **全局API状态**: {global_current}/{global_max} 个并发槽位正在使用")
+# 令牌状态显示
+col_token1, col_token2 = st.columns(2)
+with col_token1:
+    st.info(f"🎫 可用令牌数：{available_tokens}")
+with col_token2:
+    st.info(f"🔄 全局处理中：{processing_count}")
 
 st.markdown("---")
 
@@ -637,7 +630,9 @@ with left_col:
         key=f"file_uploader_{st.session_state.file_uploader_key}"
     )
     
+    # 自动加入队列逻辑
     if uploaded_files:
+        # 添加文件到任务队列
         for uploaded_file in uploaded_files:
             st.session_state.task_counter += 1
             task = TaskItem(
@@ -646,38 +641,41 @@ with left_col:
                 file_name=uploaded_file.name
             )
             st.session_state.tasks.append(task)
-            
-            # 添加到处理队列
-            st.session_state.task_queue.put(task)
-            st.session_state.running_tasks[task.task_id] = task
         
         st.success(f"已添加 {len(uploaded_files)} 个任务到队列！")
+        
+        # 清空文件上传框
         st.session_state.file_uploader_key += 1
         st.rerun()
     
     st.markdown("---")
     
     # 队列状态说明
-    with st.expander("📊 队列状态说明", expanded=False):
-        st.markdown(f"""
+    with st.expander("📊 状态说明", expanded=False):
+        st.markdown("""
         - **队列中**: 等待开始处理
-        - **处理中**: 正在上传或AI处理
-        - **等待全局槽位**: 等待全局API并发槽位
-        - **等待重试**: API繁忙，排队等待
+        - **等待令牌**: 正在等待获取全局处理令牌
+        - **本地处理中**: 本实例正在处理的任务
+        - **全局处理中**: 所有实例正在处理的任务总数
         - **已完成**: 处理成功
         - **失败**: 处理失败（超过重试次数）
         
-        **🔧 并发控制说明:**
-        - 全局最多 {MAX_GLOBAL_CONCURRENT} 个任务同时调用API（跨用户）
-        - 单用户最多 {MAX_LOCAL_CONCURRENT} 个任务同时处理
-        - 超出限制的任务会自动排队等待
-        """)
+        **Redis分布式特性**：
+        - 全局并发限制：{} 个任务
+        - 多实例共享令牌桶
+        - 自动负载均衡
+        """.format(GLOBAL_CONCURRENT_LIMIT))
     
-    with st.expander("⚙️ API 配置信息", expanded=False):
+    with st.expander("⚙️ Redis & API 配置", expanded=False):
+        st.markdown("**Redis配置：**")
+        st.text(f"Host: {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
+        st.text(f"Database: {REDIS_CONFIG['db']}")
+        st.text(f"令牌桶Key: {TOKEN_BUCKET_KEY}")
+        st.text(f"全局并发限制: {GLOBAL_CONCURRENT_LIMIT}")
+        
+        st.markdown("**API配置：**")
         st.text_input("API Key", value=API_KEY, disabled=True)
         st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
-        st.markdown("**节点信息配置：**")
-        st.json(NODE_INFO)
 
 with right_col:
     st.markdown("### 📊 任务队列")
@@ -685,6 +683,16 @@ with right_col:
     if not st.session_state.tasks:
         st.info("暂无任务，请上传图片开始处理")
     else:
+        # 启动新任务的逻辑 - 移除了本地并发限制，完全依赖Redis令牌
+        for task in st.session_state.tasks:
+            if task.status == "QUEUED" and 'token_manager' in st.session_state:
+                thread = threading.Thread(
+                    target=process_single_task,
+                    args=(task, API_KEY, WEBAPP_ID, NODE_INFO, st.session_state.token_manager)
+                )
+                thread.daemon = True
+                thread.start()
+        
         # 显示所有任务
         for task in reversed(st.session_state.tasks):
             with st.container():
@@ -695,6 +703,8 @@ with right_col:
                     st.markdown(f"**📄 {task.file_name}** (Task-{task.task_id})")
                     if task.retry_count > 0:
                         st.caption(f"重试次数: {task.retry_count}/{task.max_retries}")
+                    if task.token_id:
+                        st.caption(f"🎫 持有令牌: {task.token_id}")
                 with col_status:
                     if task.status == "SUCCESS":
                         st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
@@ -702,8 +712,8 @@ with right_col:
                         st.markdown('<span class="error-badge">❌ 失败</span>', unsafe_allow_html=True)
                     elif task.status in ["UPLOADING", "PROCESSING"]:
                         st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
-                    elif task.status == "WAITING_GLOBAL":
-                        st.markdown('<span class="waiting-badge">🌐 等待全局槽位</span>', unsafe_allow_html=True)
+                    elif task.status == "WAITING_TOKEN":
+                        st.markdown('<span class="token-waiting-badge">🎫 等待令牌</span>', unsafe_allow_html=True)
                     elif task.status == "WAITING":
                         st.markdown('<span class="waiting-badge">⏳ 等待重试</span>', unsafe_allow_html=True)
                     else:
@@ -716,24 +726,26 @@ with right_col:
                     
                     if task.start_time:
                         elapsed = time.time() - task.start_time
-                        remaining = max(0, 180 - elapsed)
+                        remaining = max(0, 180 - elapsed)  # 预计3分钟
                         minutes = int(remaining // 60)
                         seconds = int(remaining % 60)
                         st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
-                elif task.status == "WAITING_GLOBAL":
-                    st.warning(f"⏳ 全局API并发已满({global_current}/{global_max})，等待其他用户任务完成...")
+                elif task.status == "WAITING_TOKEN":
+                    st.warning("🎫 正在等待获取全局处理令牌...")
                 elif task.status == "WAITING":
                     st.info("API服务繁忙，正在等待重试...")
                 
-                # 结果显示
+                # 结果显示 - 使用滑动对比
                 if task.status == "SUCCESS" and task.result_data:
                     elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                     st.success(f"✅ 处理完成！用时: {elapsed_str}")
                     
+                    # 显示滑动对比组件
                     st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
                     comparison_html = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
                     components.html(comparison_html, height=600)
                     
+                    # 使用说明
                     st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
                 
                 elif task.status == "FAILED":
@@ -746,27 +758,20 @@ with right_col:
         
         if st.button("🗑️ 清空所有任务"):
             st.session_state.tasks = []
-            st.session_state.running_tasks = {}
-            # 清空队列
-            while not st.session_state.task_queue.empty():
-                try:
-                    st.session_state.task_queue.get_nowait()
-                except queue.Empty:
-                    break
             st.rerun()
 
 # 页脚
 st.markdown("---")
 st.markdown(f"""
 <div style='text-align: center; color: #7f8c8d;'>
-    <p>🚀 支持最多{MAX_GLOBAL_CONCURRENT}个全局API并发（跨用户），智能排队管理</p>
-    <p>📤 上传文件后自动加入处理队列，智能重试机制确保成功率</p>
+    <p>🚀 支持Redis分布式令牌桶，全局并发限制={GLOBAL_CONCURRENT_LIMIT}个任务</p>
+    <p>📤 多实例水平扩容，自动负载均衡和令牌管理</p>
     <p>🔍 完成后支持原图与AI优化图片的滑动对比预览，点击图片右下角图标直接下载</p>
-    <p>🌐 全局并发控制确保API稳定，超出限制的请求自动排队等待</p>
+    <p>🎫 当前可用令牌: {available_tokens}/{GLOBAL_CONCURRENT_LIMIT}</p>
 </div>
 """, unsafe_allow_html=True)
 
 # 自动刷新
-if any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "WAITING_GLOBAL"] for t in st.session_state.tasks):
+if any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "WAITING_TOKEN"] for t in st.session_state.tasks):
     time.sleep(2)
     st.rerun()
