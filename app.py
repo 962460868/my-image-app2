@@ -11,6 +11,7 @@ import json
 import random
 import streamlit.components.v1 as components
 import redis 
+import logging
 
 # --- 1. 全局配置和Redis初始化 ---
 
@@ -21,6 +22,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# 配置日志以减少WebSocket错误噪音
+logging.getLogger("tornado.access").setLevel(logging.WARNING)
+logging.getLogger("tornado.application").setLevel(logging.WARNING)
+logging.getLogger("tornado.general").setLevel(logging.WARNING)
 
 # Redis 配置 (使用您的连接信息)
 REDIS_HOST = 'redis-18743.c340.ap-northeast-2-1.ec2.redns.redis-cloud.com'
@@ -106,7 +112,11 @@ if 'file_uploader_key' not in st.session_state:
 # 缓存已完成任务的HTML，避免重复加载Base64数据
 if 'completed_html_cache' not in st.session_state:
     st.session_state.completed_html_cache = {}
-
+# 添加错误处理状态
+if 'last_error_time' not in st.session_state:
+    st.session_state.last_error_time = 0
+if 'error_count' not in st.session_state:
+    st.session_state.error_count = 0
 
 # 配置常量
 MAX_LOCAL_CONCURRENT = 5  # 本地最大并发数（已不再重要，但保留）
@@ -134,7 +144,6 @@ CONCURRENT_LIMIT_ERRORS = [
 # Redis 键名
 GLOBAL_TASK_QUEUE = "runninghub:task_queue"
 GLOBAL_PROCESSING_SET = "runninghub:processing_tasks"
-
 
 # --- 2. TaskItem 类和序列化助手函数 ---
 
@@ -175,10 +184,8 @@ def update_task_from_redis_data(task: TaskItem, data: dict):
     task.created_at = datetime.fromisoformat(data['created_at'])
     task.status = "QUEUED" # 标记为已被调度器取出，正在排队等待线程启动
 
-
 # --- 3. 辅助函数 (WebP 优化版本) ---
 
-# <--- 关键修改：WebP 优化功能 ---
 def create_before_after_comparison(original_data, result_data, task_id):
     """
     创建原图与结果图的滑动对比组件
@@ -215,8 +222,6 @@ def create_before_after_comparison(original_data, result_data, task_id):
     result_b64_download = base64.b64encode(result_data).decode()
 
     # --- 3. 生成 HTML ---
-    # (HTML 结构不变, 仅修改 `src` 和 `link.href`)
-    
     html_code = f"""
     <div id="comparison-container-{task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
         
@@ -358,18 +363,13 @@ def create_before_after_comparison(original_data, result_data, task_id):
     """
     
     return html_code
-# <--- WebP 优化功能结束 ---
-
 
 def is_concurrent_limit_error(error_msg):
     """检查是否是并发限制错误"""
     error_msg_lower = error_msg.lower()
     return any(keyword in error_msg_lower for keyword in CONCURRENT_LIMIT_ERRORS)
 
-# ... (upload_file, run_task, fetch_task_output, download_result_image 函数保持不变) ...
-
 def upload_file(file_data, file_name, api_key):
-    # ... (与原代码相同) ...
     url = 'https://www.runninghub.cn/task/openapi/upload'
     
     files = {'file': (file_name, file_data)}
@@ -388,7 +388,6 @@ def upload_file(file_data, file_name, api_key):
         raise Exception(error_msg)
 
 def run_task(api_key, webapp_id, node_info_list):
-    # ... (与原代码相同) ...
     run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
     headers = {'Content-Type': 'application/json'}
     payload = {
@@ -410,7 +409,6 @@ def run_task(api_key, webapp_id, node_info_list):
     return task_id
 
 def fetch_task_output(api_key, task_id):
-    # ... (与原代码相同) ...
     output_url = 'https://www.runninghub.cn/task/openapi/outputs'
     
     response = requests.post(output_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
@@ -427,12 +425,10 @@ def fetch_task_output(api_key, task_id):
         raise Exception(f"获取结果失败: {data.get('msg', '未知错误')}")
 
 def download_result_image(url):
-    # ... (与原代码相同) ...
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
     content = response.content
     return content
-
 
 # --- 4. 任务处理逻辑修改 (移除 session_state 访问) ---
 
@@ -448,7 +444,7 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
         task.start_time = time.time()
         task.progress = 5
         
-        # ⚠️ 步骤 0: 注册到全局处理集合 (在调度器中已完成，此处再次确认/保留)
+        # 注册到全局处理集合
         r.sadd(processing_set_key, task_id_str)
         
         # 步骤1: 上传文件
@@ -510,10 +506,6 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
             task.progress = 100
             task.status = "SUCCESS"
             task.elapsed_time = time.time() - task.start_time
-            
-            # <--- 修改点 1：移除线程中的 session_state 写入
-            # (已移除) st.session_state.completed_html_cache[task.task_id] = ...
-            # 这一行(原第452行)已被删除，因为它在非主线程中访问 session_state 导致了错误。
 
         else:
             raise Exception(f"任务未成功完成，最终状态: {status}")
@@ -541,255 +533,310 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
                  task.error_message += " (达到最大重试次数)"
             
     finally:
-        # ⚠️ 步骤 F: 无论成功、失败或重新入队，都从全局处理集合中移除
+        # 无论成功、失败或重新入队，都从全局处理集合中移除
         r.srem(processing_set_key, task_id_str)
 
+# --- 5. 错误处理和安全刷新函数 ---
 
-# --- 5. 主界面 (增加主线程缓存逻辑) ---
-
-st.title("🎨 RunningHub AI - 智能图片优化工具 (分布式队列)")
-
-# ⚠️ 移除顶部的统计信息，移入左侧栏底部
-
-# 左右分栏
-left_col, right_col = st.columns([2, 3])
-
-with left_col:
-    st.markdown("### 📁 图片上传")
-    
-    uploaded_files = st.file_uploader(
-        "选择图片文件（支持多选）",
-        type=['png', 'jpg', 'jpeg', 'webp'],
-        accept_multiple_files=True,
-        help="上传后自动加入全局处理队列，等待任意空闲机器调度。",
-        key=f"file_uploader_{st.session_state.file_uploader_key}"
-    )
-    
-    # 自动加入队列逻辑 (推入 Redis 队列)
-    if uploaded_files:
-        if not st.session_state.redis_connected:
-            st.error("无法连接到Redis，请检查配置或稍后再试。")
-        else:
-            new_tasks = []
-            for uploaded_file in uploaded_files:
-                st.session_state.task_counter += 1
-                task = TaskItem(
-                    task_id=st.session_state.task_counter,
-                    file_data=uploaded_file.getvalue(),
-                    file_name=uploaded_file.name
-                )
-                st.session_state.tasks.append(task)
-                new_tasks.append(task)
-                
-            if new_tasks:
-                pipe = r.pipeline()
-                for task in new_tasks:
-                    task_data_json = serialize_task_data(task)
-                    pipe.rpush(GLOBAL_TASK_QUEUE, task_data_json) # 尾部插入
-                pipe.execute()
-                
-                st.success(f"已添加 {len(uploaded_files)} 个任务到**全局队列**！")
-                
-                st.session_state.file_uploader_key += 1
-                st.rerun()
-    
-    st.markdown("---")
-    
-    # ⚠️ 顶部信息和API配置信息移入左侧栏底部的折叠容器
-    
-    with st.expander("📊 全局状态与API配置信息", expanded=False):
+def safe_rerun():
+    """安全的页面刷新函数，包含错误处理"""
+    try:
+        st.rerun()
+    except Exception as e:
+        error_str = str(e).lower()
+        current_time = time.time()
         
-        # 状态信息
-        if st.session_state.redis_connected:
-            st.markdown(f"**Redis状态:** ✅ 连接成功 | 全局并发限制: **{MAX_GLOBAL_CONCURRENT}**")
+        # 检查是否是WebSocket相关错误
+        if any(keyword in error_str for keyword in ['websocketclosederror', 'streamclosederror', 'tornado']):
+            # 记录错误但不显示给用户
+            st.session_state.error_count += 1
+            st.session_state.last_error_time = current_time
             
-            global_queued = r.llen(GLOBAL_TASK_QUEUE)
-            global_processing = r.scard(GLOBAL_PROCESSING_SET)
-            local_completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
-            local_failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
-            local_waiting_retry = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
-            total_submitted = len(st.session_state.tasks)
-
-            st.markdown("""
-            | 状态指标 | 数值 |
-            | :--- | :--- |
-            | **全局队列中** | {} |
-            | **全局处理中** | {} / {} |
-            | **本次提交总数** | {} |
-            | **已完成 (本地)** | {} |
-            | **本地失败/重试** | {} / {} |
-            """.format(global_queued, global_processing, MAX_GLOBAL_CONCURRENT, total_submitted, local_completed, local_failed, local_waiting_retry))
-            
+            # 如果错误过于频繁，暂时停止刷新
+            if st.session_state.error_count > 10:
+                if current_time - st.session_state.last_error_time > 60:  # 1分钟后重置
+                    st.session_state.error_count = 0
+                else:
+                    return  # 暂时停止刷新
         else:
-            st.error(f"❌ Redis连接失败，全局排队系统不可用。错误: {st.session_state.redis_error}")
+            # 非WebSocket错误，显示给用户
+            st.error(f"页面刷新时发生错误: {e}")
+
+def should_auto_refresh():
+    """判断是否应该自动刷新"""
+    if not st.session_state.redis_connected:
+        return False
+        
+    # 检查是否有需要刷新的条件
+    has_active_tasks = any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "QUEUED"] for t in st.session_state.tasks)
+    
+    try:
+        has_global_queue = r.llen(GLOBAL_TASK_QUEUE) > 0
+        has_global_processing = r.scard(GLOBAL_PROCESSING_SET) > 0
+    except:
+        has_global_queue = False
+        has_global_processing = False
+        
+    return has_active_tasks or has_global_queue or has_global_processing
+
+# --- 6. 主界面 (增加主线程缓存逻辑) ---
+
+def main():
+    st.title("🎨 RunningHub AI - 智能图片优化工具 (分布式队列)")
+
+    # 左右分栏
+    left_col, right_col = st.columns([2, 3])
+
+    with left_col:
+        st.markdown("### 📁 图片上传")
+        
+        uploaded_files = st.file_uploader(
+            "选择图片文件（支持多选）",
+            type=['png', 'jpg', 'jpeg', 'webp'],
+            accept_multiple_files=True,
+            help="上传后自动加入全局处理队列，等待任意空闲机器调度。",
+            key=f"file_uploader_{st.session_state.file_uploader_key}"
+        )
+        
+        # 自动加入队列逻辑 (推入 Redis 队列)
+        if uploaded_files:
+            if not st.session_state.redis_connected:
+                st.error("无法连接到Redis，请检查配置或稍后再试。")
+            else:
+                new_tasks = []
+                for uploaded_file in uploaded_files:
+                    st.session_state.task_counter += 1
+                    task = TaskItem(
+                        task_id=st.session_state.task_counter,
+                        file_data=uploaded_file.getvalue(),
+                        file_name=uploaded_file.name
+                    )
+                    st.session_state.tasks.append(task)
+                    new_tasks.append(task)
+                    
+                if new_tasks:
+                    try:
+                        pipe = r.pipeline()
+                        for task in new_tasks:
+                            task_data_json = serialize_task_data(task)
+                            pipe.rpush(GLOBAL_TASK_QUEUE, task_data_json) # 尾部插入
+                        pipe.execute()
+                        
+                        st.success(f"已添加 {len(uploaded_files)} 个任务到**全局队列**！")
+                        
+                        st.session_state.file_uploader_key += 1
+                        safe_rerun()
+                    except Exception as e:
+                        st.error(f"添加任务到队列失败: {e}")
         
         st.markdown("---")
-        st.markdown("**API配置信息：**")
-        st.text_input("API Key", value=API_KEY, disabled=True)
-        st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
-        st.markdown("**Redis连接信息：**")
-        st.json({
-            "Host": REDIS_HOST,
-            "Port": REDIS_PORT,
-            "Queue Key": GLOBAL_TASK_QUEUE,
-            "Processing Key": GLOBAL_PROCESSING_SET
-        })
-        st.markdown("**节点信息配置：**")
-        st.json(NODE_INFO)
-
-
-with right_col:
-    st.markdown("### 📊 任务队列 (本地视图)")
-    
-    if not st.session_state.tasks:
-        st.info("暂无任务，请上传图片开始处理")
-    else:
-        # --- 核心：全局调度器 (在此机器上运行) ---
         
-        if st.session_state.redis_connected:
-            global_processing_count = r.scard(GLOBAL_PROCESSING_SET)
-            available_slots = MAX_GLOBAL_CONCURRENT - global_processing_count
+        # 全局状态与API配置信息
+        with st.expander("📊 全局状态与API配置信息", expanded=False):
             
-            # 2. 从全局任务队列拉取任务 (如果还有空位)
-            if available_slots > 0:
-                for _ in range(available_slots):
-                    task_json = r.lpop(GLOBAL_TASK_QUEUE)
+            # 状态信息
+            if st.session_state.redis_connected:
+                st.markdown(f"**Redis状态:** ✅ 连接成功 | 全局并发限制: **{MAX_GLOBAL_CONCURRENT}**")
+                
+                try:
+                    global_queued = r.llen(GLOBAL_TASK_QUEUE)
+                    global_processing = r.scard(GLOBAL_PROCESSING_SET)
+                    local_completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
+                    local_failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
+                    local_waiting_retry = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
+                    total_submitted = len(st.session_state.tasks)
+
+                    st.markdown("""
+                    | 状态指标 | 数值 |
+                    | :--- | :--- |
+                    | **全局队列中** | {} |
+                    | **全局处理中** | {} / {} |
+                    | **本次提交总数** | {} |
+                    | **已完成 (本地)** | {} |
+                    | **本地失败/重试** | {} / {} |
+                    """.format(global_queued, global_processing, MAX_GLOBAL_CONCURRENT, total_submitted, local_completed, local_failed, local_waiting_retry))
+                except Exception as e:
+                    st.warning(f"获取Redis状态时出错: {e}")
+                
+            else:
+                st.error(f"❌ Redis连接失败，全局排队系统不可用。错误: {st.session_state.redis_error}")
+            
+            st.markdown("---")
+            st.markdown("**API配置信息：**")
+            st.text_input("API Key", value=API_KEY, disabled=True)
+            st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
+            st.markdown("**Redis连接信息：**")
+            st.json({
+                "Host": REDIS_HOST,
+                "Port": REDIS_PORT,
+                "Queue Key": GLOBAL_TASK_QUEUE,
+                "Processing Key": GLOBAL_PROCESSING_SET
+            })
+            st.markdown("**节点信息配置：**")
+            st.json(NODE_INFO)
+
+    with right_col:
+        st.markdown("### 📊 任务队列 (本地视图)")
+        
+        if not st.session_state.tasks:
+            st.info("暂无任务，请上传图片开始处理")
+        else:
+            # 核心：全局调度器
+            if st.session_state.redis_connected:
+                try:
+                    global_processing_count = r.scard(GLOBAL_PROCESSING_SET)
+                    available_slots = MAX_GLOBAL_CONCURRENT - global_processing_count
                     
-                    if task_json:
-                        task_data = json.loads(task_json)
-                        task_id = task_data['task_id']
-                        
-                        local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
-                        
-                        if local_task and local_task.file_data:
-                            update_task_from_redis_data(local_task, task_data) 
+                    # 从全局任务队列拉取任务
+                    if available_slots > 0:
+                        for _ in range(available_slots):
+                            task_json = r.lpop(GLOBAL_TASK_QUEUE)
                             
-                            # 立即将任务ID加入全局处理集合，占据槽位
-                            r.sadd(GLOBAL_PROCESSING_SET, str(local_task.task_id))
-                            
-                            thread = threading.Thread(
-                                target=process_single_task,
-                                args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO, r, GLOBAL_PROCESSING_SET, GLOBAL_TASK_QUEUE)
-                            )
-                            thread.daemon = True
-                            thread.start()
-                            
-                            local_task.status = "UPLOADING" 
-                            
+                            if task_json:
+                                task_data = json.loads(task_json)
+                                task_id = task_data['task_id']
+                                
+                                local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
+                                
+                                if local_task and local_task.file_data:
+                                    update_task_from_redis_data(local_task, task_data) 
+                                    
+                                    # 立即将任务ID加入全局处理集合，占据槽位
+                                    r.sadd(GLOBAL_PROCESSING_SET, str(local_task.task_id))
+                                    
+                                    thread = threading.Thread(
+                                        target=process_single_task,
+                                        args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO, r, GLOBAL_PROCESSING_SET, GLOBAL_TASK_QUEUE)
+                                    )
+                                    thread.daemon = True
+                                    thread.start()
+                                    
+                                    local_task.status = "UPLOADING" 
+                                    
+                                else:
+                                    # 任务ID不在本地，重新放回队列让其他机器处理
+                                    if task_data.get('retry_count', 0) > 0:
+                                        r.rpush(GLOBAL_TASK_QUEUE, task_json)
+                except Exception as e:
+                    st.error(f"调度器运行时出错: {e}")
+            
+            # 显示所有任务
+            for task in reversed(st.session_state.tasks):
+                with st.container():
+                    st.markdown(f'<div class="task-card">', unsafe_allow_html=True)
+                    
+                    col_title, col_status = st.columns([3, 1])
+                    with col_title:
+                        st.markdown(f"**📄 {task.file_name}** (Task-{task.task_id})")
+                        if task.retry_count > 0:
+                            st.caption(f"重试次数: {task.retry_count}/{task.max_retries}")
+                    with col_status:
+                        if task.status == "SUCCESS":
+                            st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
+                        elif task.status == "FAILED":
+                            st.markdown('<span class="error-badge">❌ 失败</span>', unsafe_allow_html=True)
+                        elif task.status in ["UPLOADING", "PROCESSING"]:
+                            st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
+                        elif task.status == "WAITING":
+                            st.markdown('<span class="waiting-badge">⏳ 等待重试/重新排队</span>', unsafe_allow_html=True) 
+                        elif task.status == "QUEUED":
+                            st.markdown('<span class="info-badge">⏸️ 已被调度，等待线程启动</span>', unsafe_allow_html=True)
                         else:
-                            # 任务ID在全局队列中，但不在本地 session_state 中 (其他机器上传的任务)
-                            # 由于无法处理，此任务被丢弃。如果需要其他机器处理，应使用更复杂的机制。
-                            # ⚠️ 再次将其放回队列，让其他机器有机会处理（仅针对并发失败重试的任务）
-                            if task_data.get('retry_count', 0) > 0:
-                                r.rpush(GLOBAL_TASK_QUEUE, task_json)
-                            # 如果是新上传的任务，说明此机器未保存文件数据，跳过
-        
-        # --- 调度器结束 ---
-        
-        # 显示所有任务
-        for task in reversed(st.session_state.tasks):
-            with st.container():
-                st.markdown(f'<div class="task-card">', unsafe_allow_html=True)
-                
-                col_title, col_status = st.columns([3, 1])
-                with col_title:
-                    st.markdown(f"**📄 {task.file_name}** (Task-{task.task_id})")
-                    if task.retry_count > 0:
-                        st.caption(f"重试次数: {task.retry_count}/{task.max_retries}")
-                with col_status:
-                    if task.status == "SUCCESS":
-                        st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
-                    elif task.status == "FAILED":
-                        st.markdown('<span class="error-badge">❌ 失败</span>', unsafe_allow_html=True)
-                    elif task.status in ["UPLOADING", "PROCESSING"]:
-                        st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
+                             st.markdown('<span class="info-badge">📦 待推入全局队列</span>', unsafe_allow_html=True)
+                    
+                    # 进度条
+                    if task.status in ["UPLOADING", "PROCESSING"]:
+                        st.progress(task.progress / 100)
+                        st.caption(f"进度: {task.progress}%")
+                        
+                        if task.start_time:
+                            elapsed = time.time() - task.start_time
+                            remaining = max(0, 180 - elapsed)
+                            minutes = int(remaining // 60)
+                            seconds = int(remaining % 60)
+                            st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
                     elif task.status == "WAITING":
-                        st.markdown('<span class="waiting-badge">⏳ 等待重试/重新排队</span>', unsafe_allow_html=True) 
-                    elif task.status == "QUEUED":
-                        st.markdown('<span class="info-badge">⏸️ 已被调度，等待线程启动</span>', unsafe_allow_html=True)
-                    else:
-                         st.markdown('<span class="info-badge">📦 待推入全局队列</span>', unsafe_allow_html=True)
-                
-                # 进度条
-                if task.status in ["UPLOADING", "PROCESSING"]:
-                    st.progress(task.progress / 100)
-                    st.caption(f"进度: {task.progress}%")
+                        st.info(task.error_message)
                     
-                    if task.start_time:
-                        elapsed = time.time() - task.start_time
-                        remaining = max(0, 180 - elapsed)
-                        minutes = int(remaining // 60)
-                        seconds = int(remaining % 60)
-                        st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
-                elif task.status == "WAITING":
-                    st.info(task.error_message)
-                
-                # <--- 修改点 2：将缓存生成逻辑移至主线程UI渲染部分
-                
-                # 结果显示 - 检查是否需要生成和缓存 HTML
-                if task.status == "SUCCESS":
-                    elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
-                    st.success(f"✅ 处理完成！用时: {elapsed_str}")
+                    # 结果显示 - 检查是否需要生成和缓存 HTML
+                    if task.status == "SUCCESS":
+                        elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
+                        st.success(f"✅ 处理完成！用时: {elapsed_str}")
+                        
+                        # 检查缓存中是否已有，如果没有，则在主线程中生成并缓存
+                        if task.task_id not in st.session_state.completed_html_cache:
+                            try:
+                                # 确保数据都存在
+                                if task.file_data and task.result_data:
+                                    # 使用优化后的 create_before_after_comparison 函数
+                                    st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
+                                else:
+                                    st.warning("任务数据不完整，无法生成对比图。")
+                            except Exception as e:
+                                st.error(f"生成对比图时出错: {e}")
+                        
+                        # 现在可以安全地从缓存中读取
+                        if task.task_id in st.session_state.completed_html_cache:
+                            st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
+                            # 使用缓存的 HTML，避免重复 Base64 加载
+                            components.html(st.session_state.completed_html_cache[task.task_id], height=600)
+                            st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
                     
-                    # (关键修改) 检查缓存中是否已有，如果没有，则在主线程中生成并缓存
-                    if task.task_id not in st.session_state.completed_html_cache:
-                        try:
-                            # 确保数据都存在 (task.result_data 是由子线程填充的)
-                            if task.file_data and task.result_data:
-                                # 使用优化后的 create_before_after_comparison 函数
-                                st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
-                            else:
-                                st.warning("任务数据不完整，无法生成对比图。")
-                        except Exception as e:
-                            st.error(f"生成对比图时出错: {e}")
+                    elif task.status == "FAILED":
+                        st.error(f"❌ 最终失败: {task.error_message}")
                     
-                    # 现在可以安全地从缓存中读取
-                    if task.task_id in st.session_state.completed_html_cache:
-                        st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
-                        # 使用缓存的 HTML，避免重复 Base64 加载
-                        components.html(st.session_state.completed_html_cache[task.task_id], height=600)
-                        st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
-                
-                # <--- 修改点 2 结束
-                
-                elif task.status == "FAILED":
-                    st.error(f"❌ 最终失败: {task.error_message}")
-                
-                st.markdown('</div>', unsafe_allow_html=True)
-                st.markdown("---")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown("---")
+            
+            # 清空按钮
+            col_local, col_global = st.columns(2)
+            with col_local:
+                if st.button("🗑️ 清空本地任务"):
+                    st.session_state.tasks = []
+                    st.session_state.completed_html_cache = {}
+                    safe_rerun()
+            with col_global:
+                if st.button("🔥 清空全局队列和处理中的任务", help="**危险操作**：会停止所有机器上正在处理的任务，并清空所有排队任务。"):
+                    try:
+                        r.delete(GLOBAL_TASK_QUEUE)
+                        r.delete(GLOBAL_PROCESSING_SET)
+                        st.session_state.tasks = []
+                        st.session_state.completed_html_cache = {}
+                        st.success("已清空全局队列和处理中的任务！")
+                        safe_rerun()
+                    except Exception as e:
+                        st.error(f"清空全局队列时出错: {e}")
+
+    # 页脚
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #7f8c8d;'>
+        <p>🚀 基于Redis实现分布式限流，**全局并发限制在5**，多机器提交任务自动排队</p>
+        <p>📤 上传文件后，任务进入Redis全局队列，由任一空闲机器调度处理</p>
+        <p>⚡️ **性能优化**：对比图使用 WebP 加速加载，同时保留高质量下载</p>
+        <p>🔧 **已优化**：修复了WebSocket连接错误，改善了页面稳定性</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# --- 7. 应用入口点和自动刷新逻辑 ---
+
+if __name__ == "__main__":
+    try:
+        main()
         
-        # 清空按钮
-        col_local, col_global = st.columns(2)
-        with col_local:
-            if st.button("🗑️ 清空本地任务"):
-                st.session_state.tasks = []
-                st.session_state.completed_html_cache = {}
-                st.rerun()
-        with col_global:
-            if st.button("🔥 清空全局队列和处理中的任务", help="**危险操作**：会停止所有机器上正在处理的任务，并清空所有排队任务。"):
-                r.delete(GLOBAL_TASK_QUEUE)
-                r.delete(GLOBAL_PROCESSING_SET)
-                st.session_state.tasks = []
-                st.session_state.completed_html_cache = {}
-                st.success("已清空全局队列和处理中的任务！")
-                st.rerun()
-
-
-# 页脚
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #7f8c8d;'>
-    <p>🚀 基于Redis实现分布式限流，**全局并发限制在5**，多机器提交任务自动排队</p>
-    <p>📤 上传文件后，任务进入Redis全局队列，由任一空闲机器调度处理</p>
-    <p>⚡️ **性能优化**：对比图使用 WebP 加速加载，同时保留高质量下载</p>
-</div>
-""", unsafe_allow_html=True)
-
-# 自动刷新 
-if (st.session_state.redis_connected and (
-    any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "QUEUED"] for t in st.session_state.tasks) or
-    r.llen(GLOBAL_TASK_QUEUE) > 0 or
-    r.scard(GLOBAL_PROCESSING_SET) > 0
-)):
-    time.sleep(2)
-    st.rerun()
+        # 自动刷新逻辑（使用安全刷新）
+        if should_auto_refresh():
+            time.sleep(2)
+            safe_rerun()
+            
+    except Exception as e:
+        error_str = str(e).lower()
+        if any(keyword in error_str for keyword in ['websocketclosederror', 'streamclosederror', 'tornado']):
+            # WebSocket错误，静默处理
+            st.session_state.error_count = st.session_state.get('error_count', 0) + 1
+        else:
+            # 其他错误，显示给用户
+            st.error(f"应用运行时发生错误: {e}")
+            st.info("页面将在几秒后自动刷新...")
+            time.sleep(3)
+            safe_rerun()
