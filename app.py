@@ -472,8 +472,9 @@ def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, proces
             task.status = "SUCCESS"
             task.elapsed_time = time.time() - task.start_time
             
-            # ⚠️ 性能优化：任务成功后，生成 HTML 并缓存
-            st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
+            # <--- 修改点 1：移除线程中的 session_state 写入
+            # (已移除) st.session_state.completed_html_cache[task.task_id] = ...
+            # 这一行(原第452行)已被删除，因为它在非主线程中访问 session_state 导致了错误。
 
         else:
             raise Exception(f"任务未成功完成，最终状态: {status}")
@@ -684,16 +685,32 @@ with right_col:
                 elif task.status == "WAITING":
                     st.info(task.error_message)
                 
-                # 结果显示 - 使用缓存的 HTML
-                if task.status == "SUCCESS" and task.task_id in st.session_state.completed_html_cache:
+                # <--- 修改点 2：将缓存生成逻辑移至主线程UI渲染部分
+                
+                # 结果显示 - 检查是否需要生成和缓存 HTML
+                if task.status == "SUCCESS":
                     elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                     st.success(f"✅ 处理完成！用时: {elapsed_str}")
                     
-                    st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
-                    # 使用缓存的 HTML，避免重复 Base64 加载
-                    components.html(st.session_state.completed_html_cache[task.task_id], height=600)
+                    # (关键修改) 检查缓存中是否已有，如果没有，则在主线程中生成并缓存
+                    if task.task_id not in st.session_state.completed_html_cache:
+                        try:
+                            # 确保数据都存在 (task.result_data 是由子线程填充的)
+                            if task.file_data and task.result_data:
+                                st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
+                            else:
+                                st.warning("任务数据不完整，无法生成对比图。")
+                        except Exception as e:
+                            st.error(f"生成对比图时出错: {e}")
                     
-                    st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
+                    # 现在可以安全地从缓存中读取
+                    if task.task_id in st.session_state.completed_html_cache:
+                        st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
+                        # 使用缓存的 HTML，避免重复 Base64 加载
+                        components.html(st.session_state.completed_html_cache[task.task_id], height=600)
+                        st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
+                
+                # <--- 修改点 2 结束
                 
                 elif task.status == "FAILED":
                     st.error(f"❌ 最终失败: {task.error_message}")
