@@ -8,6 +8,7 @@ import threading
 import base64
 import copy
 import json
+import random
 
 # 页面配置
 st.set_page_config(
@@ -57,6 +58,10 @@ st.markdown("""
         color: #17a2b8;
         font-weight: bold;
     }
+    .waiting-badge {
+        color: #9b59b6;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -67,17 +72,29 @@ if 'processing_count' not in st.session_state:
     st.session_state.processing_count = 0
 if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
-if 'processed_files' not in st.session_state:
-    st.session_state.processed_files = set()
+if 'file_uploader_key' not in st.session_state:
+    st.session_state.file_uploader_key = 0
 
 # 配置常量
-MAX_CONCURRENT = 5  # 修改为5
+MAX_LOCAL_CONCURRENT = 5  # 本地最大并发数
 API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
     {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
     {"nodeId": "60", "fieldName": "text", "fieldValue": "8k, high quality, high detail", "description": "正向提示词补充"},
     {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
+]
+
+# API并发限制相关的错误关键词
+CONCURRENT_LIMIT_ERRORS = [
+    "concurrent limit",
+    "too many requests",
+    "rate limit",
+    "队列已满",
+    "并发限制",
+    "服务忙碌",
+    "CONCURRENT_LIMIT_EXCEEDED",
+    "TOO_MANY_REQUESTS"
 ]
 
 class TaskItem:
@@ -95,6 +112,13 @@ class TaskItem:
         self.created_at = datetime.now()
         self.start_time = None
         self.elapsed_time = None
+        self.retry_count = 0  # 重试次数
+        self.max_retries = 10  # 最大重试次数
+
+def is_concurrent_limit_error(error_msg):
+    """检查是否是并发限制错误"""
+    error_msg_lower = error_msg.lower()
+    return any(keyword in error_msg_lower for keyword in CONCURRENT_LIMIT_ERRORS)
 
 def upload_file(file_data, file_name, api_key):
     """上传文件到服务器"""
@@ -238,26 +262,43 @@ def process_single_task(task, api_key, webapp_id, node_info):
             raise Exception(f"任务未成功完成，最终状态: {status}")
             
     except Exception as e:
-        task.status = "FAILED"
-        task.error_message = str(e)
-        task.elapsed_time = time.time() - task.start_time if task.start_time else 0
+        error_msg = str(e)
+        
+        # 检查是否是并发限制错误
+        if is_concurrent_limit_error(error_msg) and task.retry_count < task.max_retries:
+            # 并发限制错误，回到队列等待重试
+            task.status = "WAITING"  # 新状态：等待重试
+            task.retry_count += 1
+            task.progress = 0
+            # 随机等待2-10秒后重试，避免所有任务同时重试
+            wait_time = random.randint(2, 10)
+            time.sleep(wait_time)
+            task.status = "QUEUED"  # 重新排队
+        else:
+            # 其他错误或超过最大重试次数
+            task.status = "FAILED"
+            task.error_message = error_msg
+            task.elapsed_time = time.time() - task.start_time if task.start_time else 0
 
 # 主界面
 st.title("🎨 RunningHub AI - 智能图片优化工具")
 st.markdown("### 专业的AI图片优化和增强服务")
 
 # 统计信息
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
     queued = sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
     st.metric("队列中", queued)
 with col2:
     processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
-    st.metric(f"处理中", f"{processing}/{MAX_CONCURRENT}")
+    st.metric(f"处理中", f"{processing}/{MAX_LOCAL_CONCURRENT}")
 with col3:
+    waiting = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
+    st.metric("等待重试", waiting)
+with col4:
     completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
     st.metric("已完成", completed)
-with col4:
+with col5:
     failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
     st.metric("失败", failed)
 
@@ -269,38 +310,44 @@ left_col, right_col = st.columns([2, 3])
 with left_col:
     st.markdown("### 📁 图片上传")
     
+    # 🔧 使用key参数来控制file_uploader的状态
     uploaded_files = st.file_uploader(
         "选择图片文件（支持多选）",
         type=['png', 'jpg', 'jpeg', 'webp'],
         accept_multiple_files=True,
-        help="可以一次选择多张图片进行批量处理，上传后自动加入处理队列"
+        help="可以一次选择多张图片进行批量处理，上传后自动加入处理队列",
+        key=f"file_uploader_{st.session_state.file_uploader_key}"
     )
     
     # 自动加入队列逻辑
     if uploaded_files:
-        new_files = []
+        # 添加文件到任务队列
         for uploaded_file in uploaded_files:
-            file_key = f"{uploaded_file.name}_{uploaded_file.size}"
-            if file_key not in st.session_state.processed_files:
-                st.session_state.processed_files.add(file_key)
-                new_files.append(uploaded_file)
+            st.session_state.task_counter += 1
+            task = TaskItem(
+                task_id=st.session_state.task_counter,
+                file_data=uploaded_file.getvalue(),
+                file_name=uploaded_file.name
+            )
+            st.session_state.tasks.append(task)
         
-        if new_files:
-            for uploaded_file in new_files:
-                st.session_state.task_counter += 1
-                task = TaskItem(
-                    task_id=st.session_state.task_counter,
-                    file_data=uploaded_file.getvalue(),
-                    file_name=uploaded_file.name
-                )
-                st.session_state.tasks.append(task)
-            
-            st.success(f"已自动添加 {len(new_files)} 个任务到队列！")
-            st.rerun()
+        st.success(f"已添加 {len(uploaded_files)} 个任务到队列！")
         
-        st.info(f"当前已选择 {len(uploaded_files)} 个文件")
+        # 🔧 清空文件上传框：通过改变key来重置file_uploader
+        st.session_state.file_uploader_key += 1
+        st.rerun()
     
     st.markdown("---")
+    
+    # 队列状态说明
+    with st.expander("📊 队列状态说明", expanded=False):
+        st.markdown("""
+        - **队列中**: 等待开始处理
+        - **处理中**: 正在上传或AI处理
+        - **等待重试**: API繁忙，排队等待
+        - **已完成**: 处理成功
+        - **失败**: 处理失败（超过重试次数）
+        """)
     
     with st.expander("⚙️ API 配置信息", expanded=False):
         st.text_input("API Key", value=API_KEY, disabled=True)
@@ -316,8 +363,9 @@ with right_col:
     else:
         current_processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
         
+        # 启动新任务（包括重试的任务）
         for task in st.session_state.tasks:
-            if task.status == "QUEUED" and current_processing < MAX_CONCURRENT:
+            if task.status == "QUEUED" and current_processing < MAX_LOCAL_CONCURRENT:
                 thread = threading.Thread(
                     target=process_single_task,
                     args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
@@ -334,6 +382,8 @@ with right_col:
                 col_title, col_status = st.columns([3, 1])
                 with col_title:
                     st.markdown(f"**📄 {task.file_name}** (Task-{task.task_id})")
+                    if task.retry_count > 0:
+                        st.caption(f"重试次数: {task.retry_count}/{task.max_retries}")
                 with col_status:
                     if task.status == "SUCCESS":
                         st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
@@ -341,6 +391,8 @@ with right_col:
                         st.markdown('<span class="error-badge">❌ 失败</span>', unsafe_allow_html=True)
                     elif task.status in ["UPLOADING", "PROCESSING"]:
                         st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
+                    elif task.status == "WAITING":
+                        st.markdown('<span class="waiting-badge">⏳ 等待重试</span>', unsafe_allow_html=True)
                     else:
                         st.markdown('<span class="info-badge">⏸️ 队列中</span>', unsafe_allow_html=True)
                 
@@ -355,6 +407,8 @@ with right_col:
                         minutes = int(remaining // 60)
                         seconds = int(remaining % 60)
                         st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
+                elif task.status == "WAITING":
+                    st.info("API服务繁忙，正在等待重试...")
                 
                 # 结果显示
                 if task.status == "SUCCESS" and task.result_data:
@@ -375,6 +429,8 @@ with right_col:
                 
                 elif task.status == "FAILED":
                     st.error(f"❌ 处理失败: {task.error_message}")
+                    if task.retry_count >= task.max_retries:
+                        st.warning("已达到最大重试次数")
                 
                 st.markdown('</div>', unsafe_allow_html=True)
                 st.markdown("---")
@@ -382,19 +438,18 @@ with right_col:
         if st.button("🗑️ 清空所有任务"):
             st.session_state.tasks = []
             st.session_state.processing_count = 0
-            st.session_state.processed_files = set()
             st.rerun()
 
 # 页脚
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
-    <p>🚀 支持最多5个并发任务同时处理</p>
-    <p>📤 上传文件后自动加入处理队列，无需手动操作</p>
+    <p>🚀 支持最多5个本地并发任务，API繁忙时自动排队等待</p>
+    <p>📤 上传文件后自动加入处理队列，智能重试机制确保成功率</p>
 </div>
 """, unsafe_allow_html=True)
 
 # 自动刷新
-if any(t.status in ["UPLOADING", "PROCESSING"] for t in st.session_state.tasks):
+if any(t.status in ["UPLOADING", "PROCESSING", "WAITING"] for t in st.session_state.tasks):
     time.sleep(2)
     st.rerun()
