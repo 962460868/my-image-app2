@@ -386,3 +386,4 @@ st.markdown("""
 if any(t.status in ["UPLOADING", "PROCESSING"] for t in st.session_state.tasks):
     time.sleep(2)
     st.rerun()
+    
