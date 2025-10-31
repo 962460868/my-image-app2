@@ -10,6 +10,7 @@ import copy
 import json
 import random
 import streamlit.components.v1 as components
+from streamlit_server_state import server_state, server_state_lock
 
 # 页面配置
 st.set_page_config(
@@ -63,21 +64,34 @@ st.markdown("""
         color: #9b59b6;
         font-weight: bold;
     }
+    .queue-badge {
+        color: #6c757d;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# 初始化全局服务器状态
+with server_state_lock["global_processing_count"]:
+    if "global_processing_count" not in server_state:
+        server_state.global_processing_count = 0
+
+with server_state_lock["global_task_queue"]:
+    if "global_task_queue" not in server_state:
+        server_state.global_task_queue = []
 
 # 初始化 session_state
 if 'tasks' not in st.session_state:
     st.session_state.tasks = []
-if 'processing_count' not in st.session_state:
-    st.session_state.processing_count = 0
 if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = f"session_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
 # 配置常量
-MAX_LOCAL_CONCURRENT = 5  # 本地最大并发数
+MAX_GLOBAL_CONCURRENT = 5  # 全局最大并发数（对应API限制）
 API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
@@ -89,7 +103,7 @@ NODE_INFO = [
 # API并发限制相关的错误关键词
 CONCURRENT_LIMIT_ERRORS = [
     "concurrent limit",
-    "too many requests",
+    "too many requests", 
     "rate limit",
     "队列已满",
     "并发限制",
@@ -100,8 +114,9 @@ CONCURRENT_LIMIT_ERRORS = [
 
 class TaskItem:
     """任务项类"""
-    def __init__(self, task_id, file_data, file_name):
+    def __init__(self, task_id, file_data, file_name, session_id):
         self.task_id = task_id
+        self.session_id = session_id  # 添加会话ID
         self.file_data = file_data
         self.file_name = file_name
         self.status = "QUEUED"
@@ -113,8 +128,65 @@ class TaskItem:
         self.created_at = datetime.now()
         self.start_time = None
         self.elapsed_time = None
-        self.retry_count = 0  # 重试次数
-        self.max_retries = 10  # 最大重试次数
+        self.retry_count = 0
+        self.max_retries = 10
+
+def add_task_to_global_queue(task):
+    """将任务添加到全局队列"""
+    with server_state_lock["global_task_queue"]:
+        # 创建任务的字典表示（因为server_state需要可序列化的对象）
+        task_dict = {
+            'task_id': task.task_id,
+            'session_id': task.session_id,
+            'file_name': task.file_name,
+            'created_at': task.created_at.isoformat(),
+            'status': task.status
+        }
+        server_state.global_task_queue.append(task_dict)
+
+def get_next_task_from_queue():
+    """从全局队列获取下一个要处理的任务"""
+    with server_state_lock["global_task_queue"]:
+        if server_state.global_task_queue:
+            # 按创建时间排序，获取最早的任务
+            server_state.global_task_queue.sort(key=lambda x: x['created_at'])
+            return server_state.global_task_queue.pop(0)
+    return None
+
+def remove_task_from_queue(session_id, task_id):
+    """从全局队列移除指定任务"""
+    with server_state_lock["global_task_queue"]:
+        server_state.global_task_queue = [
+            t for t in server_state.global_task_queue 
+            if not (t['session_id'] == session_id and t['task_id'] == task_id)
+        ]
+
+def increment_processing_count():
+    """增加全局处理计数"""
+    with server_state_lock["global_processing_count"]:
+        server_state.global_processing_count += 1
+        return server_state.global_processing_count
+
+def decrement_processing_count():
+    """减少全局处理计数"""
+    with server_state_lock["global_processing_count"]:
+        if server_state.global_processing_count > 0:
+            server_state.global_processing_count -= 1
+        return server_state.global_processing_count
+
+def get_processing_count():
+    """获取当前全局处理计数"""
+    with server_state_lock["global_processing_count"]:
+        return server_state.global_processing_count
+
+def get_queue_position(session_id, task_id):
+    """获取任务在全局队列中的位置"""
+    with server_state_lock["global_task_queue"]:
+        queue = sorted(server_state.global_task_queue, key=lambda x: x['created_at'])
+        for i, task in enumerate(queue):
+            if task['session_id'] == session_id and task['task_id'] == task_id:
+                return i + 1
+    return 0
 
 def create_before_after_comparison(original_data, result_data, task_id):
     """创建原图与结果图的滑动对比组件"""
@@ -283,7 +355,7 @@ def upload_file(file_data, file_name, api_key):
     response_data = response.json()
     
     if response_data.get("code") == 0:
-        uploaded_filename = response_data['data']['fileName']
+        uploaded_filename = response_data['data'] ['fileName']
         return uploaded_filename
     else:
         error_msg = f"图片上传失败: {response_data.get('msg', '未知错误')}"
@@ -308,7 +380,7 @@ def run_task(api_key, webapp_id, node_info_list):
         error_msg = f"发起任务失败: {run_data.get('msg', '未知错误')}"
         raise Exception(error_msg)
     
-    task_id = run_data['data']['taskId']
+    task_id = run_data['data'] ['taskId']
     return task_id
 
 def fetch_task_output(api_key, task_id):
@@ -320,7 +392,7 @@ def fetch_task_output(api_key, task_id):
     data = response.json()
     
     if data.get("code") == 0 and data.get("data"):
-        file_url = data["data"][0].get("fileUrl")
+        file_url = data["data"] [0].get("fileUrl")
         if file_url:
             return file_url
         else:
@@ -338,6 +410,9 @@ def download_result_image(url):
 def process_single_task(task, api_key, webapp_id, node_info):
     """处理单个任务"""
     try:
+        # 增加全局处理计数
+        current_count = increment_processing_count()
+        
         task.status = "UPLOADING"
         task.start_time = time.time()
         task.progress = 5
@@ -361,12 +436,12 @@ def process_single_task(task, api_key, webapp_id, node_info):
         
         # 步骤4: 轮询状态
         progress = 20
-        max_polls = 60  # 最多轮询60次（约3分钟）
+        max_polls = 60
         poll_count = 0
         status = None
         
         while poll_count < max_polls:
-            time.sleep(3)  # 每3秒轮询一次
+            time.sleep(3)
             poll_count += 1
             
             status_url = 'https://www.runninghub.cn/task/openapi/status'
@@ -375,9 +450,8 @@ def process_single_task(task, api_key, webapp_id, node_info):
             data = response.json()
             status = data.get('data')
             
-            # 缓慢增长进度条：从20%到95%
             if progress < 95:
-                progress += min(2, (95 - progress) / 10)  # 越接近95%增长越慢
+                progress += min(2, (95 - progress) / 10)
                 progress = int(progress)
             
             task.progress = progress
@@ -387,23 +461,18 @@ def process_single_task(task, api_key, webapp_id, node_info):
             elif status == "FAILED":
                 raise Exception("任务处理失败")
             elif status in ["QUEUED", "RUNNING"]:
-                # 继续等待
                 continue
             else:
                 continue
         
-        # 检查是否超时
         if poll_count >= max_polls:
             raise Exception("任务处理超时")
         
-        # 只有在状态为SUCCESS时才获取结果
         if status == "SUCCESS":
-            # 步骤5: 获取结果
             task.progress = 95
             result_url = fetch_task_output(api_key, task.api_task_id)
             task.result_url = result_url
             
-            # 步骤6: 下载结果
             task.result_data = download_result_image(result_url)
             task.progress = 100
             task.status = "SUCCESS"
@@ -414,21 +483,23 @@ def process_single_task(task, api_key, webapp_id, node_info):
     except Exception as e:
         error_msg = str(e)
         
-        # 检查是否是并发限制错误
         if is_concurrent_limit_error(error_msg) and task.retry_count < task.max_retries:
-            # 并发限制错误，回到队列等待重试
-            task.status = "WAITING"  # 新状态：等待重试
+            task.status = "WAITING"
             task.retry_count += 1
             task.progress = 0
-            # 随机等待2-10秒后重试，避免所有任务同时重试
+            # 重新加入全局队列
+            add_task_to_global_queue(task)
             wait_time = random.randint(2, 10)
             time.sleep(wait_time)
-            task.status = "QUEUED"  # 重新排队
+            task.status = "QUEUED"
         else:
-            # 其他错误或超过最大重试次数
             task.status = "FAILED"
             task.error_message = error_msg
             task.elapsed_time = time.time() - task.start_time if task.start_time else 0
+    
+    finally:
+        # 减少全局处理计数
+        decrement_processing_count()
 
 # 主界面
 st.title("🎨 RunningHub AI - 智能图片优化工具")
@@ -436,21 +507,29 @@ st.markdown("### 专业的AI图片优化和增强服务")
 
 # 统计信息
 col1, col2, col3, col4, col5 = st.columns(5)
+
+# 获取全局统计
+global_processing = get_processing_count()
+with server_state_lock["global_task_queue"]:
+    global_queue_size = len(server_state.global_task_queue)
+
+# 本地统计
+local_queued = sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
+local_processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
+local_waiting = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
+local_completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
+local_failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
+
 with col1:
-    queued = sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
-    st.metric("队列中", queued)
+    st.metric("全局队列", global_queue_size)
 with col2:
-    processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
-    st.metric(f"处理中", f"{processing}/{MAX_LOCAL_CONCURRENT}")
+    st.metric("全局处理中", f"{global_processing}/{MAX_GLOBAL_CONCURRENT}")
 with col3:
-    waiting = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
-    st.metric("等待重试", waiting)
+    st.metric("等待重试", local_waiting)
 with col4:
-    completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
-    st.metric("已完成", completed)
+    st.metric("已完成", local_completed)
 with col5:
-    failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
-    st.metric("失败", failed)
+    st.metric("失败", local_failed)
 
 st.markdown("---")
 
@@ -460,30 +539,28 @@ left_col, right_col = st.columns([2, 3])
 with left_col:
     st.markdown("### 📁 图片上传")
     
-    # 🔧 使用key参数来控制file_uploader的状态
     uploaded_files = st.file_uploader(
         "选择图片文件（支持多选）",
         type=['png', 'jpg', 'jpeg', 'webp'],
         accept_multiple_files=True,
-        help="可以一次选择多张图片进行批量处理，上传后自动加入处理队列",
+        help="可以一次选择多张图片进行批量处理，上传后自动加入全局处理队列",
         key=f"file_uploader_{st.session_state.file_uploader_key}"
     )
     
-    # 自动加入队列逻辑
     if uploaded_files:
-        # 添加文件到任务队列
         for uploaded_file in uploaded_files:
             st.session_state.task_counter += 1
             task = TaskItem(
                 task_id=st.session_state.task_counter,
                 file_data=uploaded_file.getvalue(),
-                file_name=uploaded_file.name
+                file_name=uploaded_file.name,
+                session_id=st.session_state.session_id
             )
             st.session_state.tasks.append(task)
+            # 添加到全局队列
+            add_task_to_global_queue(task)
         
-        st.success(f"已添加 {len(uploaded_files)} 个任务到队列！")
-        
-        # 🔧 清空文件上传框：通过改变key来重置file_uploader
+        st.success(f"已添加 {len(uploaded_files)} 个任务到全局队列！")
         st.session_state.file_uploader_key += 1
         st.rerun()
     
@@ -492,16 +569,22 @@ with left_col:
     # 队列状态说明
     with st.expander("📊 队列状态说明", expanded=False):
         st.markdown("""
-        - **队列中**: 等待开始处理
-        - **处理中**: 正在上传或AI处理
-        - **等待重试**: API繁忙，排队等待
+        - **全局队列**: 所有用户的等待任务总数
+        - **全局处理中**: 当前正在处理的任务数/最大并发数
+        - **等待重试**: API繁忙，排队等待重试
         - **已完成**: 处理成功
         - **失败**: 处理失败（超过重试次数）
+        
+        **新的全局并发控制机制：**
+        - 所有用户共享最多5个并发处理槽位
+        - 超过限制的任务自动进入全局队列等待
+        - 智能重试机制，API繁忙时自动排队
         """)
     
     with st.expander("⚙️ API 配置信息", expanded=False):
         st.text_input("API Key", value=API_KEY, disabled=True)
         st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
+        st.markdown(f"**全局并发限制**: {MAX_GLOBAL_CONCURRENT}")
         st.markdown("**节点信息配置：**")
         st.json(NODE_INFO)
 
@@ -511,18 +594,28 @@ with right_col:
     if not st.session_state.tasks:
         st.info("暂无任务，请上传图片开始处理")
     else:
-        current_processing = sum(1 for t in st.session_state.tasks if t.status in ["UPLOADING", "PROCESSING"])
+        # 全局并发控制逻辑
+        current_global_processing = get_processing_count()
         
-        # 启动新任务（包括重试的任务）
+        # 检查是否有任务可以从队列开始处理
         for task in st.session_state.tasks:
-            if task.status == "QUEUED" and current_processing < MAX_LOCAL_CONCURRENT:
-                thread = threading.Thread(
-                    target=process_single_task,
-                    args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
-                )
-                thread.daemon = True
-                thread.start()
-                current_processing += 1
+            if (task.status == "QUEUED" and 
+                current_global_processing < MAX_GLOBAL_CONCURRENT):
+                
+                # 从全局队列中获取下一个任务
+                next_task = get_next_task_from_queue()
+                if (next_task and 
+                    next_task['session_id'] == st.session_state.session_id and 
+                    next_task['task_id'] == task.task_id):
+                    
+                    # 启动任务处理
+                    thread = threading.Thread(
+                        target=process_single_task,
+                        args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
+                    )
+                    thread.daemon = True
+                    thread.start()
+                    current_global_processing += 1
         
         # 显示所有任务
         for task in reversed(st.session_state.tasks):
@@ -534,6 +627,13 @@ with right_col:
                     st.markdown(f"**📄 {task.file_name}** (Task-{task.task_id})")
                     if task.retry_count > 0:
                         st.caption(f"重试次数: {task.retry_count}/{task.max_retries}")
+                    
+                    # 显示队列位置
+                    if task.status == "QUEUED":
+                        position = get_queue_position(st.session_state.session_id, task.task_id)
+                        if position > 0:
+                            st.caption(f"全局队列位置: 第 {position} 位")
+                
                 with col_status:
                     if task.status == "SUCCESS":
                         st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
@@ -544,7 +644,7 @@ with right_col:
                     elif task.status == "WAITING":
                         st.markdown('<span class="waiting-badge">⏳ 等待重试</span>', unsafe_allow_html=True)
                     else:
-                        st.markdown('<span class="info-badge">⏸️ 队列中</span>', unsafe_allow_html=True)
+                        st.markdown('<span class="queue-badge">⏸️ 排队中</span>', unsafe_allow_html=True)
                 
                 # 进度条
                 if task.status in ["UPLOADING", "PROCESSING"]:
@@ -553,24 +653,24 @@ with right_col:
                     
                     if task.start_time:
                         elapsed = time.time() - task.start_time
-                        remaining = max(0, 180 - elapsed)  # 预计3分钟
+                        remaining = max(0, 180 - elapsed)
                         minutes = int(remaining // 60)
                         seconds = int(remaining % 60)
                         st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
                 elif task.status == "WAITING":
                     st.info("API服务繁忙，正在等待重试...")
+                elif task.status == "QUEUED":
+                    st.info(f"正在全局队列中等待处理... (当前全局并发: {current_global_processing}/{MAX_GLOBAL_CONCURRENT})")
                 
-                # 结果显示 - 使用滑动对比
+                # 结果显示
                 if task.status == "SUCCESS" and task.result_data:
                     elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                     st.success(f"✅ 处理完成！用时: {elapsed_str}")
                     
-                    # 显示滑动对比组件
                     st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
                     comparison_html = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
                     components.html(comparison_html, height=600)
                     
-                    # 使用说明
                     st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
                 
                 elif task.status == "FAILED":
@@ -582,21 +682,23 @@ with right_col:
                 st.markdown("---")
         
         if st.button("🗑️ 清空所有任务"):
+            # 从全局队列中移除本会话的所有任务
+            for task in st.session_state.tasks:
+                remove_task_from_queue(st.session_state.session_id, task.task_id)
             st.session_state.tasks = []
-            st.session_state.processing_count = 0
             st.rerun()
 
 # 页脚
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
-    <p>🚀 支持最多5个本地并发任务，API繁忙时自动排队等待</p>
-    <p>📤 上传文件后自动加入处理队列，智能重试机制确保成功率</p>
+    <p>🚀 <strong>全局并发控制</strong>：最多5个全局并发任务，多用户共享处理资源</p>
+    <p>📤 上传文件后自动加入全局处理队列，智能排队机制确保公平处理</p>
     <p>🔍 完成后支持原图与AI优化图片的滑动对比预览，点击图片右下角图标直接下载</p>
 </div>
 """, unsafe_allow_html=True)
 
 # 自动刷新
-if any(t.status in ["UPLOADING", "PROCESSING", "WAITING"] for t in st.session_state.tasks):
+if any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "QUEUED"] for t in st.session_state.tasks):
     time.sleep(2)
     st.rerun()
