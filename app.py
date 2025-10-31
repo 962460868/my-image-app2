@@ -9,6 +9,7 @@ import base64
 import copy
 import json
 import random
+import streamlit.components.v1 as components
 
 # 页面配置
 st.set_page_config(
@@ -114,6 +115,122 @@ class TaskItem:
         self.elapsed_time = None
         self.retry_count = 0  # 重试次数
         self.max_retries = 10  # 最大重试次数
+
+def create_before_after_comparison(original_data, result_data, task_id):
+    """创建原图与结果图的滑动对比组件"""
+    # 将图片数据转换为base64
+    original_b64 = base64.b64encode(original_data).decode()
+    result_b64 = base64.b64encode(result_data).decode()
+    
+    html_code = f"""
+    <div id="comparison-container-{task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+        <!-- 原图 (背景层) -->
+        <img id="original-{task_id}" src="data:image/png;base64,{original_b64}" 
+             style="width: 100%; height: auto; display: block;" alt="原图">
+        
+        <!-- 结果图 (遮罩层) -->
+        <div id="result-overlay-{task_id}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden;">
+            <img id="result-{task_id}" src="data:image/png;base64,{result_b64}" 
+                 style="width: 100%; height: 100%; object-fit: cover;" alt="优化后">
+        </div>
+        
+        <!-- 分割线 -->
+        <div id="divider-{task_id}" style="position: absolute; top: 0; width: 4px; height: 100%; background: linear-gradient(to bottom, #fff 0%, #3498db 50%, #fff 100%); cursor: ew-resize; z-index: 10; left: 50%; margin-left: -2px; box-shadow: 0 0 10px rgba(0,0,0,0.3);">
+            <!-- 拖动手柄 -->
+            <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 40px; height: 40px; background: #3498db; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">
+                <div style="width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-top: 6px solid white; margin-right: 2px;"></div>
+                <div style="width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-bottom: 6px solid white; margin-left: 2px;"></div>
+            </div>
+        </div>
+        
+        <!-- 标签 -->
+        <div style="position: absolute; top: 15px; left: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
+            原图
+        </div>
+        <div style="position: absolute; top: 15px; right: 15px; background: rgba(52, 152, 219, 0.9); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold;">
+            AI优化
+        </div>
+    </div>
+
+    <script>
+    (function() {{
+        const container = document.getElementById('comparison-container-{task_id}');
+        const divider = document.getElementById('divider-{task_id}');
+        const resultOverlay = document.getElementById('result-overlay-{task_id}');
+        
+        if (!container || !divider || !resultOverlay) return;
+        
+        let isDragging = false;
+        let startX = 0;
+        let startLeft = 0;
+        
+        function updateComparison(percentage) {{
+            // 限制在 5% 到 95% 之间
+            percentage = Math.max(5, Math.min(95, percentage));
+            
+            // 更新分割线位置
+            divider.style.left = percentage + '%';
+            
+            // 更新结果图遮罩
+            resultOverlay.style.clipPath = `inset(0 ${{100 - percentage}}% 0 0)`;
+        }}
+        
+        function startDrag(e) {{
+            isDragging = true;
+            startX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
+            
+            const rect = container.getBoundingClientRect();
+            const currentLeft = parseFloat(divider.style.left) || 50;
+            startLeft = currentLeft;
+            
+            document.addEventListener(e.type.includes('touch') ? 'touchmove' : 'mousemove', handleDrag);
+            document.addEventListener(e.type.includes('touch') ? 'touchend' : 'mouseup', stopDrag);
+            
+            e.preventDefault();
+        }}
+        
+        function handleDrag(e) {{
+            if (!isDragging) return;
+            
+            const currentX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
+            const rect = container.getBoundingClientRect();
+            const deltaX = currentX - startX;
+            const deltaPercentage = (deltaX / rect.width) * 100;
+            const newPercentage = startLeft + deltaPercentage;
+            
+            updateComparison(newPercentage);
+            e.preventDefault();
+        }}
+        
+        function stopDrag() {{
+            isDragging = false;
+            document.removeEventListener('mousemove', handleDrag);
+            document.removeEventListener('mouseup', stopDrag);
+            document.removeEventListener('touchmove', handleDrag);
+            document.removeEventListener('touchend', stopDrag);
+        }}
+        
+        // 初始化为显示结果图（70%）
+        updateComparison(70);
+        
+        // 绑定事件
+        divider.addEventListener('mousedown', startDrag);
+        divider.addEventListener('touchstart', startDrag);
+        
+        // 点击容器其他位置也可以调整
+        container.addEventListener('click', function(e) {{
+            if (e.target === divider || divider.contains(e.target)) return;
+            
+            const rect = container.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const percentage = (clickX / rect.width) * 100;
+            updateComparison(percentage);
+        }});
+    }})();
+    </script>
+    """
+    
+    return html_code
 
 def is_concurrent_limit_error(error_msg):
     """检查是否是并发限制错误"""
@@ -410,13 +527,18 @@ with right_col:
                 elif task.status == "WAITING":
                     st.info("API服务繁忙，正在等待重试...")
                 
-                # 结果显示
+                # 结果显示 - 使用滑动对比
                 if task.status == "SUCCESS" and task.result_data:
                     elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
                     st.success(f"✅ 处理完成！用时: {elapsed_str}")
                     
-                    img = Image.open(io.BytesIO(task.result_data))
-                    st.image(img, caption="优化后的图片", use_container_width=True)
+                    # 显示滑动对比组件
+                    st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比）")
+                    comparison_html = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
+                    components.html(comparison_html, height=600)
+                    
+                    # 使用说明
+                    st.caption("💡 左侧显示原图，右侧显示AI优化后的效果。拖动中间线或点击图片任意位置进行对比。")
                     
                     download_filename = f"optimized_{task.file_name}"
                     st.download_button(
@@ -446,6 +568,7 @@ st.markdown("""
 <div style='text-align: center; color: #7f8c8d;'>
     <p>🚀 支持最多5个本地并发任务，API繁忙时自动排队等待</p>
     <p>📤 上传文件后自动加入处理队列，智能重试机制确保成功率</p>
+    <p>🔍 完成后支持原图与AI优化图片的滑动对比预览</p>
 </div>
 """, unsafe_allow_html=True)
 
