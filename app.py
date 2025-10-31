@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import time
 import io
-from PIL import Image  # 确保 PIL (Pillow) 已安装
+from PIL import Image
 from datetime import datetime
 import threading
 import base64
@@ -10,52 +10,55 @@ import copy
 import json
 import random
 import streamlit.components.v1 as components
-import redis 
+import redis
 import logging
 
-# --- 1. 全局配置和Redis初始化 ---
+# --- 1. 页面配置和全局设置 ---
 
-# 页面配置
 st.set_page_config(
-    page_title="RunningHub AI - 智能图片优化工具 (分布式)",
+    page_title="RunningHub AI - 智能图片优化工具",
     page_icon="🎨",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 配置日志以减少WebSocket错误噪音
+# 配置日志，减少噪音
 logging.getLogger("tornado.access").setLevel(logging.WARNING)
 logging.getLogger("tornado.application").setLevel(logging.WARNING)
 logging.getLogger("tornado.general").setLevel(logging.WARNING)
 
-# Redis 配置 (使用您的连接信息)
+# Redis配置
 REDIS_HOST = 'redis-18743.c340.ap-northeast-2-1.ec2.redns.redis-cloud.com'
 REDIS_PORT = 18743
 REDIS_PASSWORD = "dBAPubXYReEwHaIvnvX0lvr3qIgtudCp"
 
-# 初始化 Redis 连接 (仅在 session_state 中未连接时尝试)
-if 'redis_connected' not in st.session_state:
-    try:
-        r = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            decode_responses=True,
-            username="default",
-            password=REDIS_PASSWORD,
-            socket_timeout=5
-        )
-        r.ping()
-        st.session_state.r = r
-        st.session_state.redis_connected = True
-        st.session_state.redis_error = None
-    except Exception as e:
-        st.session_state.redis_connected = False
-        st.session_state.redis_error = f"Redis连接失败: {e}"
-        st.session_state.r = None
-else:
-    r = st.session_state.r # 从 session_state 获取已连接的实例
+# API配置
+API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
+WEBAPP_ID = "1947599512657453057"
+NODE_INFO = [
+    {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
+    {"nodeId": "60", "fieldName": "text", "fieldValue": "8k, high quality, high detail", "description": "正向提示词补充"},
+    {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
+]
 
-# 自定义CSS样式
+# 系统配置（优化稳定性）
+MAX_GLOBAL_CONCURRENT = 3  # 降低全局并发数，提高稳定性
+MAX_RETRIES = 3            # 降低重试次数，避免无限重试
+POLL_INTERVAL = 3          # 轮询间隔
+AUTO_REFRESH_INTERVAL = 3  # 页面自动刷新间隔
+
+# Redis键名
+GLOBAL_TASK_QUEUE = "runninghub:task_queue"
+GLOBAL_PROCESSING_SET = "runninghub:processing_tasks"
+
+# 并发限制错误关键词
+CONCURRENT_LIMIT_ERRORS = [
+    "concurrent limit", "too many requests", "rate limit",
+    "队列已满", "并发限制", "服务忙碌", "CONCURRENT_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"
+]
+
+# --- 2. 自定义CSS样式 ---
+
 st.markdown("""
 <style>
     .main {
@@ -68,191 +71,136 @@ st.markdown("""
         background-color: #3498db;
         color: white;
         font-weight: bold;
+        transition: all 0.3s ease;
     }
     .stButton>button:hover {
         background-color: #2980b9;
+        transform: translateY(-1px);
     }
     .task-card {
         background-color: white;
         border-radius: 10px;
         padding: 1.5rem;
         margin: 1rem 0;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        border: 1px solid #e1e8ed;
     }
-    .success-badge {
-        color: #27ae60;
-        font-weight: bold;
-    }
-    .error-badge {
-        color: #e74c3c;
-        font-weight: bold;
-    }
-    .processing-badge {
-        color: #f39c12;
-        font-weight: bold;
-    }
-    .info-badge {
-        color: #17a2b8;
-        font-weight: bold;
-    }
-    .waiting-badge {
-        color: #9b59b6;
-        font-weight: bold;
+    .success-badge { color: #27ae60; font-weight: bold; }
+    .error-badge { color: #e74c3c; font-weight: bold; }
+    .processing-badge { color: #f39c12; font-weight: bold; }
+    .info-badge { color: #17a2b8; font-weight: bold; }
+    .waiting-badge { color: #9b59b6; font-weight: bold; }
+    .metric-container {
+        background: white;
+        padding: 1rem;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        text-align: center;
+        border: 1px solid #e1e8ed;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# 初始化 session_state
+# --- 3. Redis连接初始化 ---
+
+@st.cache_resource
+def init_redis_connection():
+    """初始化Redis连接（缓存资源，避免重复连接）"""
+    try:
+        r = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            decode_responses=True,
+            username="default",
+            password=REDIS_PASSWORD,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+            health_check_interval=30
+        )
+        r.ping()
+        return r, None
+    except Exception as e:
+        return None, f"Redis连接失败: {str(e)}"
+
+r, redis_error = init_redis_connection()
+
+# --- 4. Session State初始化 ---
+
 if 'tasks' not in st.session_state:
     st.session_state.tasks = []
 if 'task_counter' not in st.session_state:
     st.session_state.task_counter = 0
 if 'file_uploader_key' not in st.session_state:
     st.session_state.file_uploader_key = 0
-# 缓存已完成任务的HTML，避免重复加载Base64数据
-if 'completed_html_cache' not in st.session_state:
-    st.session_state.completed_html_cache = {}
-# 添加错误处理状态
-if 'last_error_time' not in st.session_state:
-    st.session_state.last_error_time = 0
-if 'error_count' not in st.session_state:
-    st.session_state.error_count = 0
 
-# 配置常量
-MAX_LOCAL_CONCURRENT = 5  # 本地最大并发数（已不再重要，但保留）
-MAX_GLOBAL_CONCURRENT = 5 # RunningHub API的最大并发数（核心限制）
-API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
-WEBAPP_ID = "1947599512657453057"
-NODE_INFO = [
-    {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
-    {"nodeId": "60", "fieldName": "text", "fieldValue": "8k, high quality, high detail", "description": "正向提示词补充"},
-    {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
-]
-
-# API并发限制相关的错误关键词
-CONCURRENT_LIMIT_ERRORS = [
-    "concurrent limit",
-    "too many requests",
-    "rate limit",
-    "队列已满",
-    "并发限制",
-    "服务忙碌",
-    "CONCURRENT_LIMIT_EXCEEDED",
-    "TOO_MANY_REQUESTS"
-]
-
-# Redis 键名
-GLOBAL_TASK_QUEUE = "runninghub:task_queue"
-GLOBAL_PROCESSING_SET = "runninghub:processing_tasks"
-
-# --- 2. TaskItem 类和序列化助手函数 ---
+# --- 5. 任务类定义（简化版） ---
 
 class TaskItem:
-    """任务项类"""
+    """简化的任务项类"""
     def __init__(self, task_id, file_data, file_name):
         self.task_id = task_id
-        self.file_data = file_data # 原始文件数据 (仅保存在本地内存)
+        self.file_data = file_data
         self.file_name = file_name
-        self.status = "PENDING_QUEUE" # 新状态：待推入全局队列
+        self.status = "QUEUED"  # QUEUED, PROCESSING, SUCCESS, FAILED
         self.progress = 0
-        self.result_url = None
         self.result_data = None
         self.error_message = None
         self.api_task_id = None
         self.created_at = datetime.now()
         self.start_time = None
         self.elapsed_time = None
-        self.retry_count = 0  # 重试次数
-        self.max_retries = 3  # 降低重试次数，避免占用资源过久
+        self.retry_count = 0
 
-def serialize_task_data(task: TaskItem):
-    """将任务元数据序列化为JSON字符串，以便存储到Redis队列"""
-    data = {
-        'task_id': task.task_id,
-        'file_name': task.file_name,
-        'created_at': task.created_at.isoformat(),
-        'retry_count': task.retry_count,
-        'max_retries': task.max_retries,
-        # ⚠️ 注意：file_data 不被序列化
-    }
-    return json.dumps(data)
+    def to_dict(self):
+        """序列化为字典"""
+        return {
+            'task_id': self.task_id,
+            'file_name': self.file_name,
+            'created_at': self.created_at.isoformat(),
+            'retry_count': self.retry_count
+        }
 
-def update_task_from_redis_data(task: TaskItem, data: dict):
-    """从Redis中取出的数据更新本地任务实例"""
-    task.retry_count = data['retry_count']
-    task.max_retries = data['max_retries']
-    task.created_at = datetime.fromisoformat(data['created_at'])
-    task.status = "QUEUED" # 标记为已被调度器取出，正在排队等待线程启动
+# --- 6. 图片对比组件（简化稳定版） ---
 
-# --- 3. 辅助函数 (WebP 优化版本) ---
-
-def create_before_after_comparison(original_data, result_data, task_id):
-    """
-    创建原图与结果图的滑动对比组件
-    (优化：使用WebP进行显示加速，但保留原始PNG/JPG用于下载)
-    """
+def create_image_comparison(original_data, result_data, task_id):
+    """创建简化的图片对比组件"""
+    original_b64 = base64.b64encode(original_data).decode()
+    result_b64 = base64.b64encode(result_data).decode()
     
-    display_format = "webp"
-    download_format = "png" # 假设API返回的是PNG，与原代码下载逻辑一致
-    
-    # --- 1. 转换为 WebP (用于显示) ---
-    def to_webp_b64(img_bytes, quality=80):
-        """将原始图片字节转换为用于显示的WebP Base64"""
-        img = Image.open(io.BytesIO(img_bytes))
-        buffer = io.BytesIO()
-        # 使用较低质量(80)的WebP来最大化压缩，加快前端加载
-        img.save(buffer, format="WEBP", quality=quality)
-        return base64.b64encode(buffer.getvalue()).decode()
-
-    try:
-        # 转换用于显示的图片 (display images)
-        original_b64_display = to_webp_b64(original_data, quality=80)
-        result_b64_display = to_webp_b64(result_data, quality=80)
-        
-    except Exception as e:
-        # Fallback: 如果WebP转换失败，则回退到使用原始编码 (速度会变慢)
-        st.warning(f"任务 {task_id} 的WebP转换失败 ({e})。将回退到PNG显示(可能较慢)。")
-        original_b64_display = base64.b64encode(original_data).decode()
-        result_b64_display = base64.b64encode(result_data).decode()
-        display_format = "png" # 回退到PNG格式
-
-    # --- 2. 准备原始结果 (用于下载) ---
-    # 下载按钮应提供API返回的、未经压缩的原始优化结果
-    # 我们需要原始结果的 Base64
-    result_b64_download = base64.b64encode(result_data).decode()
-
-    # --- 3. 生成 HTML ---
     html_code = f"""
     <div id="comparison-container-{task_id}" style="position: relative; width: 100%; max-width: 800px; margin: 0 auto; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
-        
-        <img id="original-{task_id}" src="data:image/{display_format};base64,{original_b64_display}" 
+        <!-- 原图背景 -->
+        <img id="original-{task_id}" src="data:image/png;base64,{original_b64}" 
              style="width: 100%; height: auto; display: block;" alt="原图">
         
-        <div id="result-overlay-{task_id}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; overflow: hidden;">
-            <img id="result-{task_id}" src="data:image/{display_format};base64,{result_b64_display}" 
-                 style="width: 100%; height: 100%; object-fit: cover;" alt="优化后">
+        <!-- 结果图遮罩 -->
+        <div id="result-overlay-{task_id}" style="position: absolute; top: 0; left: 0; width: 70%; height: 100%; overflow: hidden;">
+            <img src="data:image/png;base64,{result_b64}" 
+                 style="width: 142.86%; height: 100%; object-fit: cover;" alt="AI优化">
         </div>
         
-        <div id="divider-{task_id}" style="position: absolute; top: 0; width: 4px; height: 100%; background: linear-gradient(to bottom, #fff 0%, #3498db 50%, #fff 100%); cursor: ew-resize; z-index: 10; left: 50%; margin-left: -2px; box-shadow: 0 0 10px rgba(0,0,0,0.3);">
-            <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 40px; height: 40px; background: #3498db; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">
-                <div style="width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-top: 6px solid white; margin-right: 2px;"></div>
-                <div style="width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-bottom: 6px solid white; margin-left: 2px;"></div>
+        <!-- 分割线 -->
+        <div id="divider-{task_id}" style="position: absolute; top: 0; width: 3px; height: 100%; background: #3498db; cursor: ew-resize; z-index: 10; left: 70%; margin-left: -1.5px; box-shadow: 0 0 8px rgba(52,152,219,0.5);">
+            <!-- 拖动手柄 -->
+            <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 32px; height: 32px; background: #3498db; border-radius: 50%; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0,0,0,0.2); border: 2px solid white;">
+                <span style="color: white; font-size: 12px; font-weight: bold;">⟷</span>
             </div>
         </div>
         
-        <div style="position: absolute; top: 15px; right: 15px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold; z-index: 100;">
-            原图
-        </div>
-        <div style="position: absolute; top: 15px; left: 15px; background: rgba(52, 152, 219, 0.9); color: white; padding: 5px 10px; border-radius: 15px; font-size: 12px; font-weight: bold; z-index: 100;">
+        <!-- 标签 -->
+        <div style="position: absolute; top: 10px; left: 10px; background: rgba(52, 152, 219, 0.9); color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">
             AI优化
         </div>
+        <div style="position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); color: white; padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold;">
+            原图
+        </div>
         
-        <div id="download-btn-{task_id}" style="position: absolute; bottom: 15px; right: 15px; width: 50px; height: 50px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.3); transition: all 0.3s ease; z-index: 100;" 
+        <!-- 下载按钮 -->
+        <div id="download-btn-{task_id}" style="position: absolute; bottom: 10px; right: 10px; width: 40px; height: 40px; background: rgba(52, 152, 219, 0.9); border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.3); transition: all 0.3s ease;" 
              onmouseover="this.style.background='rgba(52, 152, 219, 1)'; this.style.transform='scale(1.1)'"
              onmouseout="this.style.background='rgba(52, 152, 219, 0.9)'; this.style.transform='scale(1)'">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="white">
-                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
-            </svg>
+            <span style="color: white; font-size: 18px;">⬇</span>
         </div>
     </div>
 
@@ -266,152 +214,114 @@ def create_before_after_comparison(original_data, result_data, task_id):
         if (!container || !divider || !resultOverlay) return;
         
         let isDragging = false;
-        let startX = 0;
-        let startLeft = 0;
         
         function updateComparison(percentage) {{
-            // 限制在 5% 到 95% 之间
-            percentage = Math.max(5, Math.min(95, percentage));
-            
-            // 更新分割线位置
+            percentage = Math.max(10, Math.min(90, percentage));
             divider.style.left = percentage + '%';
-            
-            // 更新结果图遮罩
-            resultOverlay.style.clipPath = `inset(0 ${{100 - percentage}}% 0 0)`;
-        }}
-        
-        function startDrag(e) {{
-            isDragging = true;
-            startX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
-            
-            const rect = container.getBoundingClientRect();
-            const currentLeft = parseFloat(divider.style.left) || 50;
-            startLeft = currentLeft;
-            
-            document.addEventListener(e.type.includes('touch') ? 'touchmove' : 'mousemove', handleDrag);
-            document.addEventListener(e.type.includes('touch') ? 'touchend' : 'mouseup', stopDrag);
-            
-            e.preventDefault();
+            resultOverlay.style.width = percentage + '%';
+            const img = resultOverlay.querySelector('img');
+            if (img) {{
+                img.style.width = (100 / percentage * 100) + '%';
+            }}
         }}
         
         function handleDrag(e) {{
-            if (!isDragging) return;
-            
-            const currentX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
             const rect = container.getBoundingClientRect();
-            const deltaX = currentX - startX;
-            const deltaPercentage = (deltaX / rect.width) * 100;
-            const newPercentage = startLeft + deltaPercentage;
-            
-            updateComparison(newPercentage);
-            e.preventDefault();
+            const x = (e.type.includes('touch') ? e.touches[0].clientX : e.clientX) - rect.left;
+            const percentage = (x / rect.width) * 100;
+            updateComparison(percentage);
         }}
         
-        function stopDrag() {{
-            isDragging = false;
-            document.removeEventListener('mousemove', handleDrag);
-            document.removeEventListener('mouseup', stopDrag);
-            document.removeEventListener('touchmove', handleDrag);
-            document.removeEventListener('touchend', stopDrag);
-        }}
+        divider.addEventListener('mousedown', function(e) {{
+            isDragging = true;
+            document.addEventListener('mousemove', handleDrag);
+            document.addEventListener('mouseup', function() {{
+                isDragging = false;
+                document.removeEventListener('mousemove', handleDrag);
+            }});
+            e.preventDefault();
+        }});
+        
+        container.addEventListener('click', function(e) {{
+            if (e.target === downloadBtn || downloadBtn.contains(e.target)) return;
+            handleDrag(e);
+        }});
         
         // 下载功能
-        if (downloadBtn) {{
-            downloadBtn.addEventListener('click', function(e) {{
-                e.stopPropagation();
-                
-                // 创建下载链接
-                const link = document.createElement('a');
-                
-                // 优化：这里使用原始的、高质量的下载数据 (result_b64_download)
-                // 和 对应的下载格式 (download_format)
-                link.href = 'data:image/{download_format};base64,{result_b64_download}';
-                link.download = 'optimized_{task_id}.{download_format}';
-                
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-                
-                // 显示下载提示
-                const originalSvg = downloadBtn.innerHTML;
-                downloadBtn.innerHTML = '<div style="color: white; font-size: 18px; font-weight: bold;">✓</div>';
-                setTimeout(() => {{
-                    downloadBtn.innerHTML = originalSvg;
-                }}, 1000);
-            }});
-        }}
-        
-        // 初始化为显示结果图（70%）
-        updateComparison(70);
-        
-        // 绑定事件
-        divider.addEventListener('mousedown', startDrag);
-        divider.addEventListener('touchstart', startDrag);
-        
-        // 点击容器其他位置也可以调整
-        container.addEventListener('click', function(e) {{
-            // 确保点击的不是下载按钮或手柄
-            if (e.target === divider || divider.contains(e.target) || e.target === downloadBtn || downloadBtn.contains(e.target)) return;
+        downloadBtn.addEventListener('click', function(e) {{
+            e.stopPropagation();
+            const link = document.createElement('a');
+            link.href = 'data:image/png;base64,{result_b64}';
+            link.download = 'optimized_image.png';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
             
-            const rect = container.getBoundingClientRect();
-            const clickX = e.clientX - rect.left;
-            const percentage = (clickX / rect.width) * 100;
-            updateComparison(percentage);
+            // 下载反馈
+            const original = this.innerHTML;
+            this.innerHTML = '<span style="color: white; font-size: 16px;">✓</span>';
+            setTimeout(() => {{ this.innerHTML = original; }}, 1500);
         }});
+        
+        // 初始化
+        updateComparison(70);
     }})();
     </script>
     """
-    
     return html_code
+
+# --- 7. 核心API函数 ---
 
 def is_concurrent_limit_error(error_msg):
     """检查是否是并发限制错误"""
-    error_msg_lower = error_msg.lower()
-    return any(keyword in error_msg_lower for keyword in CONCURRENT_LIMIT_ERRORS)
+    error_lower = error_msg.lower()
+    return any(keyword in error_lower for keyword in CONCURRENT_LIMIT_ERRORS)
 
 def upload_file(file_data, file_name, api_key):
+    """上传文件"""
     url = 'https://www.runninghub.cn/task/openapi/upload'
-    
     files = {'file': (file_name, file_data)}
     data = {'apiKey': api_key, 'fileType': 'image'}
     
     response = requests.post(url, files=files, data=data, timeout=60)
     response.raise_for_status()
+    result = response.json()
     
-    response_data = response.json()
-    
-    if response_data.get("code") == 0:
-        uploaded_filename = response_data['data']['fileName']
-        return uploaded_filename
+    if result.get("code") == 0:
+        return result['data']['fileName']
     else:
-        error_msg = f"图片上传失败: {response_data.get('msg', '未知错误')}"
-        raise Exception(error_msg)
+        raise Exception(f"文件上传失败: {result.get('msg', '未知错误')}")
 
 def run_task(api_key, webapp_id, node_info_list):
-    run_url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
-    headers = {'Content-Type': 'application/json'}
+    """发起任务"""
+    url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
     payload = {
         "apiKey": api_key,
         "webappId": webapp_id,
         "nodeInfoList": node_info_list
     }
     
-    response = requests.post(run_url, headers=headers, json=payload, timeout=30)
+    response = requests.post(url, headers={'Content-Type': 'application/json'}, 
+                           json=payload, timeout=30)
     response.raise_for_status()
+    result = response.json()
     
-    run_data = response.json()
+    if result.get("code") != 0:
+        raise Exception(f"任务发起失败: {result.get('msg', '未知错误')}")
     
-    if run_data.get("code") != 0:
-        error_msg = f"发起任务失败: {run_data.get('msg', '未知错误')}"
-        raise Exception(error_msg)
-    
-    task_id = run_data['data']['taskId']
-    return task_id
+    return result['data']['taskId']
+
+def get_task_status(api_key, task_id):
+    """获取任务状态"""
+    url = 'https://www.runninghub.cn/task/openapi/status'
+    response = requests.post(url, json={'apiKey': api_key, 'taskId': task_id}, timeout=10)
+    response.raise_for_status()
+    return response.json().get('data')
 
 def fetch_task_output(api_key, task_id):
-    output_url = 'https://www.runninghub.cn/task/openapi/outputs'
-    
-    response = requests.post(output_url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
+    """获取任务输出"""
+    url = 'https://www.runninghub.cn/task/openapi/outputs'
+    response = requests.post(url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
     response.raise_for_status()
     data = response.json()
     
@@ -419,174 +329,206 @@ def fetch_task_output(api_key, task_id):
         file_url = data["data"][0].get("fileUrl")
         if file_url:
             return file_url
-        else:
-            raise Exception("未找到图片URL")
-    else:
-        raise Exception(f"获取结果失败: {data.get('msg', '未知错误')}")
+    
+    raise Exception(f"获取结果失败: {data.get('msg', '未找到结果')}")
 
 def download_result_image(url):
+    """下载结果图片"""
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
-    content = response.content
-    return content
+    return response.content
 
-# --- 4. 任务处理逻辑修改 (移除 session_state 访问) ---
+# --- 8. 任务处理核心逻辑 ---
 
-def process_single_task(task: TaskItem, api_key, webapp_id, node_info, r, processing_set_key, global_queue_key):
-    """
-    处理单个任务（已获得全局许可）。
-    会在Redis的全局处理集合中注册和注销任务。
-    """
-    task_id_str = str(task.task_id)
+def process_single_task(task, api_key, webapp_id, node_info):
+    """处理单个任务（简化稳定版）"""
+    task.status = "PROCESSING"
+    task.start_time = time.time()
     
     try:
-        task.status = "UPLOADING"
-        task.start_time = time.time()
-        task.progress = 5
-        
-        # 注册到全局处理集合
-        r.sadd(processing_set_key, task_id_str)
-        
         # 步骤1: 上传文件
+        task.progress = 10
         uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
-        task.progress = 15
         
         # 步骤2: 准备节点信息
+        task.progress = 20
         node_info_list = copy.deepcopy(node_info)
         for node in node_info_list:
             if node["nodeId"] == "38":
                 node["fieldValue"] = uploaded_filename
         
         # 步骤3: 发起任务
+        task.progress = 30
         task.api_task_id = run_task(api_key, webapp_id, node_info_list)
-        task.status = "PROCESSING"
-        task.progress = 20
         
         # 步骤4: 轮询状态
-        progress = 20
-        max_polls = 60  # 最多轮询60次（约3分钟）
+        max_polls = 60
         poll_count = 0
-        status = None
         
         while poll_count < max_polls:
-            time.sleep(3)  # 每3秒轮询一次
+            time.sleep(POLL_INTERVAL)
             poll_count += 1
             
-            status_url = 'https://www.runninghub.cn/task/openapi/status'
-            response = requests.post(status_url, json={'apiKey': api_key, 'taskId': task.api_task_id}, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            status = data.get('data')
+            status = get_task_status(api_key, task.api_task_id)
             
-            if progress < 95:
-                progress += min(2, (95 - progress) / 10) 
-                progress = int(progress)
-            
-            task.progress = progress
+            # 更新进度
+            task.progress = min(90, 30 + (poll_count * 60 / max_polls))
             
             if status == "SUCCESS":
                 break
             elif status == "FAILED":
-                raise Exception("任务处理失败")
-            # 持续等待
-            
-        # 检查是否超时
+                raise Exception("API任务处理失败")
+        
         if poll_count >= max_polls:
             raise Exception("任务处理超时")
         
-        # 只有在状态为SUCCESS时才获取结果
-        if status == "SUCCESS":
-            # 步骤5: 获取结果
-            task.progress = 95
-            result_url = fetch_task_output(api_key, task.api_task_id)
-            task.result_url = result_url
-            
-            # 步骤6: 下载结果
-            task.result_data = download_result_image(result_url)
-            task.progress = 100
-            task.status = "SUCCESS"
-            task.elapsed_time = time.time() - task.start_time
-
-        else:
-            raise Exception(f"任务未成功完成，最终状态: {status}")
-            
+        # 步骤5: 获取和下载结果
+        task.progress = 95
+        result_url = fetch_task_output(api_key, task.api_task_id)
+        task.result_data = download_result_image(result_url)
+        
+        # 完成
+        task.progress = 100
+        task.status = "SUCCESS"
+        task.elapsed_time = time.time() - task.start_time
+        
     except Exception as e:
         error_msg = str(e)
         task.elapsed_time = time.time() - task.start_time if task.start_time else 0
         
-        # 检查是否是并发限制错误
-        if is_concurrent_limit_error(error_msg) and task.retry_count < task.max_retries:
-            # 遇到并发限制错误：递增重试计数，并将其重新推入全局队列
+        # 简化重试逻辑
+        if (is_concurrent_limit_error(error_msg) and task.retry_count < MAX_RETRIES):
             task.retry_count += 1
-            task.status = "WAITING" # 本地显示等待重试
-            task.error_message = f"API并发限制，第{task.retry_count}次重试..."
-            
-            # 重新序列化任务信息并推回全局队列尾部
-            task_data_json = serialize_task_data(task)
-            r.rpush(global_queue_key, task_data_json)
-            
+            task.status = "QUEUED"
+            task.progress = 0
+            # 指数退避等待
+            wait_time = (2 ** task.retry_count) + random.randint(1, 3)
+            time.sleep(wait_time)
+            # 重新加入队列
+            if r:
+                r.rpush(GLOBAL_TASK_QUEUE, json.dumps(task.to_dict()))
         else:
-            # 其他错误或超过最大重试次数
             task.status = "FAILED"
             task.error_message = error_msg
-            if task.retry_count >= task.max_retries:
-                 task.error_message += " (达到最大重试次数)"
-            
+    
     finally:
-        # 无论成功、失败或重新入队，都从全局处理集合中移除
-        r.srem(processing_set_key, task_id_str)
+        # 从处理集合中移除
+        if r:
+            r.srem(GLOBAL_PROCESSING_SET, str(task.task_id))
 
-# --- 5. 错误处理和安全刷新函数 ---
+# --- 9. 队列管理函数 ---
 
-def safe_rerun():
-    """安全的页面刷新函数，包含错误处理"""
-    try:
-        st.rerun()
-    except Exception as e:
-        error_str = str(e).lower()
-        current_time = time.time()
-        
-        # 检查是否是WebSocket相关错误
-        if any(keyword in error_str for keyword in ['websocketclosederror', 'streamclosederror', 'tornado']):
-            # 记录错误但不显示给用户
-            st.session_state.error_count += 1
-            st.session_state.last_error_time = current_time
-            
-            # 如果错误过于频繁，暂时停止刷新
-            if st.session_state.error_count > 10:
-                if current_time - st.session_state.last_error_time > 60:  # 1分钟后重置
-                    st.session_state.error_count = 0
-                else:
-                    return  # 暂时停止刷新
-        else:
-            # 非WebSocket错误，显示给用户
-            st.error(f"页面刷新时发生错误: {e}")
-
-def should_auto_refresh():
-    """判断是否应该自动刷新"""
-    if not st.session_state.redis_connected:
-        return False
-        
-    # 检查是否有需要刷新的条件
-    has_active_tasks = any(t.status in ["UPLOADING", "PROCESSING", "WAITING", "QUEUED"] for t in st.session_state.tasks)
+def get_queue_stats():
+    """获取队列统计信息"""
+    if not r:
+        return {'queued': 0, 'processing': 0}
     
     try:
-        has_global_queue = r.llen(GLOBAL_TASK_QUEUE) > 0
-        has_global_processing = r.scard(GLOBAL_PROCESSING_SET) > 0
+        queued = r.llen(GLOBAL_TASK_QUEUE)
+        processing = r.scard(GLOBAL_PROCESSING_SET)
+        return {'queued': queued, 'processing': processing}
     except:
-        has_global_queue = False
-        has_global_processing = False
-        
-    return has_active_tasks or has_global_queue or has_global_processing
+        return {'queued': 0, 'processing': 0}
 
-# --- 6. 主界面 (增加主线程缓存逻辑) ---
+def start_new_tasks():
+    """启动新任务（全局调度）"""
+    if not r:
+        return
+    
+    try:
+        stats = get_queue_stats()
+        available_slots = MAX_GLOBAL_CONCURRENT - stats['processing']
+        
+        for _ in range(available_slots):
+            task_json = r.lpop(GLOBAL_TASK_QUEUE)
+            if not task_json:
+                break
+                
+            task_data = json.loads(task_json)
+            task_id = task_data['task_id']
+            
+            # 查找本地任务
+            local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
+            
+            if local_task and local_task.file_data:
+                # 更新重试次数
+                local_task.retry_count = task_data.get('retry_count', 0)
+                
+                # 加入处理集合
+                r.sadd(GLOBAL_PROCESSING_SET, str(task_id))
+                
+                # 启动处理线程
+                thread = threading.Thread(
+                    target=process_single_task,
+                    args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO)
+                )
+                thread.daemon = True
+                thread.start()
+    except Exception as e:
+        st.error(f"启动任务时出错: {e}")
+
+# --- 10. 主界面 ---
 
 def main():
-    st.title("🎨 RunningHub AI - 智能图片优化工具 (分布式队列)")
-
-    # 左右分栏
+    st.title("🎨 RunningHub AI - 智能图片优化工具")
+    st.markdown("### 稳定高效的分布式AI图片处理平台")
+    
+    # 状态展示
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    stats = get_queue_stats()
+    local_stats = {
+        'success': sum(1 for t in st.session_state.tasks if t.status == "SUCCESS"),
+        'failed': sum(1 for t in st.session_state.tasks if t.status == "FAILED"),
+        'processing': sum(1 for t in st.session_state.tasks if t.status == "PROCESSING")
+    }
+    
+    with col1:
+        st.markdown(f"""
+        <div class="metric-container">
+            <h3 style="margin:0; color:#3498db;">{stats['queued']}</h3>
+            <p style="margin:0; color:#7f8c8d;">队列中</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown(f"""
+        <div class="metric-container">
+            <h3 style="margin:0; color:#f39c12;">{stats['processing']}/{MAX_GLOBAL_CONCURRENT}</h3>
+            <p style="margin:0; color:#7f8c8d;">处理中</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        st.markdown(f"""
+        <div class="metric-container">
+            <h3 style="margin:0; color:#27ae60;">{local_stats['success']}</h3>
+            <p style="margin:0; color:#7f8c8d;">已完成</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        st.markdown(f"""
+        <div class="metric-container">
+            <h3 style="margin:0; color:#e74c3c;">{local_stats['failed']}</h3>
+            <p style="margin:0; color:#7f8c8d;">失败</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col5:
+        st.markdown(f"""
+        <div class="metric-container">
+            <h3 style="margin:0; color:#9b59b6;">{len(st.session_state.tasks)}</h3>
+            <p style="margin:0; color:#7f8c8d;">总任务</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # 主界面布局
     left_col, right_col = st.columns([2, 3])
-
+    
+    # 左侧：上传区域
     with left_col:
         st.markdown("### 📁 图片上传")
         
@@ -594,249 +536,174 @@ def main():
             "选择图片文件（支持多选）",
             type=['png', 'jpg', 'jpeg', 'webp'],
             accept_multiple_files=True,
-            help="上传后自动加入全局处理队列，等待任意空闲机器调度。",
+            help="上传后自动加入全局队列，支持多机协同处理",
             key=f"file_uploader_{st.session_state.file_uploader_key}"
         )
         
-        # 自动加入队列逻辑 (推入 Redis 队列)
         if uploaded_files:
-            if not st.session_state.redis_connected:
-                st.error("无法连接到Redis，请检查配置或稍后再试。")
+            if not r:
+                st.error("⚠️ Redis连接失败，无法使用分布式队列功能")
+                st.info("错误详情: " + (redis_error or "未知错误"))
             else:
+                # 创建新任务
                 new_tasks = []
-                for uploaded_file in uploaded_files:
+                for file in uploaded_files:
                     st.session_state.task_counter += 1
                     task = TaskItem(
                         task_id=st.session_state.task_counter,
-                        file_data=uploaded_file.getvalue(),
-                        file_name=uploaded_file.name
+                        file_data=file.getvalue(),
+                        file_name=file.name
                     )
                     st.session_state.tasks.append(task)
                     new_tasks.append(task)
+                
+                # 批量加入队列
+                try:
+                    pipe = r.pipeline()
+                    for task in new_tasks:
+                        pipe.rpush(GLOBAL_TASK_QUEUE, json.dumps(task.to_dict()))
+                    pipe.execute()
                     
-                if new_tasks:
-                    try:
-                        pipe = r.pipeline()
-                        for task in new_tasks:
-                            task_data_json = serialize_task_data(task)
-                            pipe.rpush(GLOBAL_TASK_QUEUE, task_data_json) # 尾部插入
-                        pipe.execute()
-                        
-                        st.success(f"已添加 {len(uploaded_files)} 个任务到**全局队列**！")
-                        
-                        st.session_state.file_uploader_key += 1
-                        safe_rerun()
-                    except Exception as e:
-                        st.error(f"添加任务到队列失败: {e}")
+                    st.success(f"✅ 已添加 {len(uploaded_files)} 个任务到队列！")
+                    st.session_state.file_uploader_key += 1
+                    time.sleep(0.5)
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ 添加任务失败: {e}")
         
         st.markdown("---")
         
-        # 全局状态与API配置信息
-        with st.expander("📊 全局状态与API配置信息", expanded=False):
-            
-            # 状态信息
-            if st.session_state.redis_connected:
-                st.markdown(f"**Redis状态:** ✅ 连接成功 | 全局并发限制: **{MAX_GLOBAL_CONCURRENT}**")
-                
-                try:
-                    global_queued = r.llen(GLOBAL_TASK_QUEUE)
-                    global_processing = r.scard(GLOBAL_PROCESSING_SET)
-                    local_completed = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
-                    local_failed = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
-                    local_waiting_retry = sum(1 for t in st.session_state.tasks if t.status == "WAITING")
-                    total_submitted = len(st.session_state.tasks)
-
-                    st.markdown("""
-                    | 状态指标 | 数值 |
-                    | :--- | :--- |
-                    | **全局队列中** | {} |
-                    | **全局处理中** | {} / {} |
-                    | **本次提交总数** | {} |
-                    | **已完成 (本地)** | {} |
-                    | **本地失败/重试** | {} / {} |
-                    """.format(global_queued, global_processing, MAX_GLOBAL_CONCURRENT, total_submitted, local_completed, local_failed, local_waiting_retry))
-                except Exception as e:
-                    st.warning(f"获取Redis状态时出错: {e}")
-                
+        # 系统信息
+        with st.expander("⚙️ 系统配置", expanded=False):
+            if r:
+                st.success("🟢 Redis: 已连接")
             else:
-                st.error(f"❌ Redis连接失败，全局排队系统不可用。错误: {st.session_state.redis_error}")
+                st.error(f"🔴 Redis: 连接失败 - {redis_error}")
             
-            st.markdown("---")
-            st.markdown("**API配置信息：**")
-            st.text_input("API Key", value=API_KEY, disabled=True)
-            st.text_input("WebApp ID", value=WEBAPP_ID, disabled=True)
-            st.markdown("**Redis连接信息：**")
-            st.json({
-                "Host": REDIS_HOST,
-                "Port": REDIS_PORT,
-                "Queue Key": GLOBAL_TASK_QUEUE,
-                "Processing Key": GLOBAL_PROCESSING_SET
-            })
-            st.markdown("**节点信息配置：**")
-            st.json(NODE_INFO)
-
+            st.info(f"🔧 全局并发限制: {MAX_GLOBAL_CONCURRENT}")
+            st.info(f"🔁 最大重试次数: {MAX_RETRIES}")
+            st.info(f"⏱️ 轮询间隔: {POLL_INTERVAL}秒")
+            
+            st.markdown("**API配置:**")
+            st.code(f"API Key: {API_KEY[:20]}...", language="text")
+            st.code(f"WebApp ID: {WEBAPP_ID}", language="text")
+    
+    # 右侧：任务列表
     with right_col:
-        st.markdown("### 📊 任务队列 (本地视图)")
+        st.markdown("### 📊 任务状态")
         
         if not st.session_state.tasks:
-            st.info("暂无任务，请上传图片开始处理")
+            st.info("💡 暂无任务，请上传图片开始处理")
         else:
-            # 核心：全局调度器
-            if st.session_state.redis_connected:
-                try:
-                    global_processing_count = r.scard(GLOBAL_PROCESSING_SET)
-                    available_slots = MAX_GLOBAL_CONCURRENT - global_processing_count
-                    
-                    # 从全局任务队列拉取任务
-                    if available_slots > 0:
-                        for _ in range(available_slots):
-                            task_json = r.lpop(GLOBAL_TASK_QUEUE)
-                            
-                            if task_json:
-                                task_data = json.loads(task_json)
-                                task_id = task_data['task_id']
-                                
-                                local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
-                                
-                                if local_task and local_task.file_data:
-                                    update_task_from_redis_data(local_task, task_data) 
-                                    
-                                    # 立即将任务ID加入全局处理集合，占据槽位
-                                    r.sadd(GLOBAL_PROCESSING_SET, str(local_task.task_id))
-                                    
-                                    thread = threading.Thread(
-                                        target=process_single_task,
-                                        args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO, r, GLOBAL_PROCESSING_SET, GLOBAL_TASK_QUEUE)
-                                    )
-                                    thread.daemon = True
-                                    thread.start()
-                                    
-                                    local_task.status = "UPLOADING" 
-                                    
-                                else:
-                                    # 任务ID不在本地，重新放回队列让其他机器处理
-                                    if task_data.get('retry_count', 0) > 0:
-                                        r.rpush(GLOBAL_TASK_QUEUE, task_json)
-                except Exception as e:
-                    st.error(f"调度器运行时出错: {e}")
+            # 启动新任务
+            start_new_tasks()
             
-            # 显示所有任务
+            # 显示任务
             for task in reversed(st.session_state.tasks):
                 with st.container():
-                    st.markdown(f'<div class="task-card">', unsafe_allow_html=True)
+                    st.markdown('<div class="task-card">', unsafe_allow_html=True)
                     
-                    col_title, col_status = st.columns([3, 1])
-                    with col_title:
-                        st.markdown(f"**📄 {task.file_name}** (Task-{task.task_id})")
+                    # 任务头部
+                    col_info, col_status = st.columns([3, 1])
+                    
+                    with col_info:
+                        st.markdown(f"**📄 {task.file_name}** (ID: {task.task_id})")
                         if task.retry_count > 0:
-                            st.caption(f"重试次数: {task.retry_count}/{task.max_retries}")
+                            st.caption(f"🔄 重试 {task.retry_count}/{MAX_RETRIES}")
+                    
                     with col_status:
                         if task.status == "SUCCESS":
                             st.markdown('<span class="success-badge">✅ 完成</span>', unsafe_allow_html=True)
                         elif task.status == "FAILED":
                             st.markdown('<span class="error-badge">❌ 失败</span>', unsafe_allow_html=True)
-                        elif task.status in ["UPLOADING", "PROCESSING"]:
+                        elif task.status == "PROCESSING":
                             st.markdown('<span class="processing-badge">⚡ 处理中</span>', unsafe_allow_html=True)
-                        elif task.status == "WAITING":
-                            st.markdown('<span class="waiting-badge">⏳ 等待重试/重新排队</span>', unsafe_allow_html=True) 
-                        elif task.status == "QUEUED":
-                            st.markdown('<span class="info-badge">⏸️ 已被调度，等待线程启动</span>', unsafe_allow_html=True)
                         else:
-                             st.markdown('<span class="info-badge">📦 待推入全局队列</span>', unsafe_allow_html=True)
+                            st.markdown('<span class="info-badge">⏳ 队列中</span>', unsafe_allow_html=True)
                     
-                    # 进度条
-                    if task.status in ["UPLOADING", "PROCESSING"]:
+                    # 进度显示
+                    if task.status == "PROCESSING":
                         st.progress(task.progress / 100)
-                        st.caption(f"进度: {task.progress}%")
+                        st.caption(f"进度: {int(task.progress)}%")
                         
                         if task.start_time:
                             elapsed = time.time() - task.start_time
-                            remaining = max(0, 180 - elapsed)
-                            minutes = int(remaining // 60)
-                            seconds = int(remaining % 60)
-                            st.caption(f"剩余时间: 约{minutes}分{seconds}秒")
-                    elif task.status == "WAITING":
-                        st.info(task.error_message)
+                            st.caption(f"已用时: {int(elapsed//60)}分{int(elapsed%60)}秒")
                     
-                    # 结果显示 - 检查是否需要生成和缓存 HTML
-                    if task.status == "SUCCESS":
+                    # 结果显示
+                    if task.status == "SUCCESS" and task.result_data:
                         elapsed_str = f"{int(task.elapsed_time//60)}分{int(task.elapsed_time%60)}秒"
-                        st.success(f"✅ 处理完成！用时: {elapsed_str}")
+                        st.success(f"🎉 处理成功！用时: {elapsed_str}")
                         
-                        # 检查缓存中是否已有，如果没有，则在主线程中生成并缓存
-                        if task.task_id not in st.session_state.completed_html_cache:
-                            try:
-                                # 确保数据都存在
-                                if task.file_data and task.result_data:
-                                    # 使用优化后的 create_before_after_comparison 函数
-                                    st.session_state.completed_html_cache[task.task_id] = create_before_after_comparison(task.file_data, task.result_data, task.task_id)
-                                else:
-                                    st.warning("任务数据不完整，无法生成对比图。")
-                            except Exception as e:
-                                st.error(f"生成对比图时出错: {e}")
+                        st.markdown("**🔍 效果对比** (左侧AI优化，右侧原图)")
+                        comparison_html = create_image_comparison(
+                            task.file_data, task.result_data, task.task_id
+                        )
+                        components.html(comparison_html, height=500)
                         
-                        # 现在可以安全地从缓存中读取
-                        if task.task_id in st.session_state.completed_html_cache:
-                            st.markdown("**🔍 原图 vs AI优化对比**（拖动中间线或点击任意位置对比，点击右下角图标下载）")
-                            # 使用缓存的 HTML，避免重复 Base64 加载
-                            components.html(st.session_state.completed_html_cache[task.task_id], height=600)
-                            st.caption("💡 左侧显示AI优化效果，右侧显示原图。拖动中间线或点击图片任意位置进行对比。")
+                        st.caption("💡 拖动中间分割线或点击图片任意位置对比效果，点击右下角按钮下载优化图片")
                     
                     elif task.status == "FAILED":
-                        st.error(f"❌ 最终失败: {task.error_message}")
+                        st.error(f"💥 处理失败: {task.error_message}")
                     
                     st.markdown('</div>', unsafe_allow_html=True)
                     st.markdown("---")
             
-            # 清空按钮
-            col_local, col_global = st.columns(2)
-            with col_local:
-                if st.button("🗑️ 清空本地任务"):
+            # 操作按钮
+            col_clear_local, col_clear_global = st.columns(2)
+            
+            with col_clear_local:
+                if st.button("🗑️ 清空本地任务", help="只清空本地显示的任务"):
                     st.session_state.tasks = []
-                    st.session_state.completed_html_cache = {}
-                    safe_rerun()
-            with col_global:
-                if st.button("🔥 清空全局队列和处理中的任务", help="**危险操作**：会停止所有机器上正在处理的任务，并清空所有排队任务。"):
+                    st.rerun()
+            
+            with col_clear_global:
+                if r and st.button("🔥 清空全局队列", 
+                                   help="⚠️ 危险操作：清空所有机器的队列和处理中任务"):
                     try:
-                        r.delete(GLOBAL_TASK_QUEUE)
-                        r.delete(GLOBAL_PROCESSING_SET)
+                        r.delete(GLOBAL_TASK_QUEUE, GLOBAL_PROCESSING_SET)
                         st.session_state.tasks = []
-                        st.session_state.completed_html_cache = {}
-                        st.success("已清空全局队列和处理中的任务！")
-                        safe_rerun()
+                        st.success("✅ 已清空全局队列")
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"清空全局队列时出错: {e}")
+                        st.error(f"❌ 清空失败: {e}")
 
     # 页脚
     st.markdown("---")
     st.markdown("""
-    <div style='text-align: center; color: #7f8c8d;'>
-        <p>🚀 基于Redis实现分布式限流，**全局并发限制在5**，多机器提交任务自动排队</p>
-        <p>📤 上传文件后，任务进入Redis全局队列，由任一空闲机器调度处理</p>
-        <p>⚡️ **性能优化**：对比图使用 WebP 加速加载，同时保留高质量下载</p>
-        <p>🔧 **已优化**：修复了WebSocket连接错误，改善了页面稳定性</p>
+    <div style='text-align: center; color: #7f8c8d; padding: 20px;'>
+        <h4 style='margin: 10px 0; color: #34495e;'>🚀 RunningHub AI - 企业级分布式图片处理</h4>
+        <p><strong>🔒 稳定可靠</strong> | 全局并发控制 + 智能重试机制</p>
+        <p><strong>⚡ 高效处理</strong> | 多机协同 + 队列自动调度</p>
+        <p><strong>🎨 优质效果</strong> | AI智能优化 + 实时对比预览</p>
+        <p><strong>💾 便捷下载</strong> | 一键下载高质量优化结果</p>
     </div>
     """, unsafe_allow_html=True)
 
-# --- 7. 应用入口点和自动刷新逻辑 ---
+# --- 11. 应用入口和自动刷新 ---
 
 if __name__ == "__main__":
     try:
         main()
         
-        # 自动刷新逻辑（使用安全刷新）
-        if should_auto_refresh():
-            time.sleep(2)
-            safe_rerun()
+        # 智能自动刷新
+        should_refresh = (
+            any(t.status == "PROCESSING" for t in st.session_state.tasks) or
+            (r and (r.llen(GLOBAL_TASK_QUEUE) > 0 or r.scard(GLOBAL_PROCESSING_SET) > 0))
+        )
+        
+        if should_refresh:
+            time.sleep(AUTO_REFRESH_INTERVAL)
+            st.rerun()
             
     except Exception as e:
         error_str = str(e).lower()
-        if any(keyword in error_str for keyword in ['websocketclosederror', 'streamclosederror', 'tornado']):
-            # WebSocket错误，静默处理
-            st.session_state.error_count = st.session_state.get('error_count', 0) + 1
+        if any(keyword in error_str for keyword in ['websocket', 'tornado', 'streamlit']):
+            # WebSocket等连接错误，静默处理
+            pass
         else:
-            # 其他错误，显示给用户
-            st.error(f"应用运行时发生错误: {e}")
-            st.info("页面将在几秒后自动刷新...")
-            time.sleep(8)
-            safe_rerun()
+            st.error(f"⚠️ 系统错误: {e}")
+            st.info("页面将自动刷新...")
+            time.sleep(5)
+            st.rerun()
