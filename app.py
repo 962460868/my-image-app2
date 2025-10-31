@@ -838,5 +838,5 @@ if __name__ == "__main__":
             # 其他错误，显示给用户
             st.error(f"应用运行时发生错误: {e}")
             st.info("页面将在几秒后自动刷新...")
-            time.sleep(3)
+            time.sleep(8)
             safe_rerun()
