@@ -31,7 +31,7 @@ REDIS_PORT = 18743
 REDIS_PASSWORD = "dBAPubXYReEwHaIvnvX0lvr3qIgtudCp"
 
 # API配置
-API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
+API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
     {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
@@ -40,7 +40,7 @@ NODE_INFO = [
 ]
 
 # 系统配置
-MAX_GLOBAL_CONCURRENT = 5  
+MAX_GLOBAL_CONCURRENT = 10  
 MAX_LOCAL_CONCURRENT = 3   
 MAX_RETRIES = 3            
 POLL_INTERVAL = 3          
