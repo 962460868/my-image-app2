@@ -4,11 +4,8 @@ import time
 from datetime import datetime
 import threading
 import copy
-import json
 import random
-import redis
 import logging
-import pickle
 import streamlit.components.v1 as components
 
 # --- 1. 页面配置和全局设置 ---
@@ -25,14 +22,8 @@ logging.getLogger("tornado.access").setLevel(logging.ERROR)
 logging.getLogger("tornado.application").setLevel(logging.ERROR)
 logging.getLogger("tornado.general").setLevel(logging.ERROR)
 
-# Redis配置
-REDIS_HOST = 'redis-18743.c340.ap-northeast-2-1.ec2.redns.redis-cloud.com'
-REDIS_PORT = 18743
-REDIS_PASSWORD = "dBAPubXYReEwHaIvnvX0lvr3qIgtudCp"
-
 # API配置
 API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
-API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
     {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
@@ -41,20 +32,13 @@ NODE_INFO = [
 ]
 
 # 系统配置
-MAX_GLOBAL_CONCURRENT = 5  
-MAX_GLOBAL_CONCURRENT = 10  
-MAX_LOCAL_CONCURRENT = 3   
-MAX_RETRIES = 3            
-POLL_INTERVAL = 3          
-MAX_POLL_COUNT = 300       
-AUTO_REFRESH_INTERVAL = 6  # 减少到6秒以提高响应性
-DISPLAY_TIMEOUT_MINUTES = 3  
-ACTUAL_TIMEOUT_MINUTES = 15  
-
-# Redis键名
-GLOBAL_TASK_QUEUE = "runninghub:task_queue"
-GLOBAL_PROCESSING_SET = "runninghub:processing_tasks"
-SESSION_DATA_PREFIX = "runninghub:session:"
+MAX_CONCURRENT = 5  # 单网页最大并发数
+MAX_RETRIES = 3
+POLL_INTERVAL = 3
+MAX_POLL_COUNT = 300
+AUTO_REFRESH_INTERVAL = 6
+DISPLAY_TIMEOUT_MINUTES = 3
+ACTUAL_TIMEOUT_MINUTES = 15
 
 # 并发限制错误关键词
 CONCURRENT_LIMIT_ERRORS = [
@@ -164,7 +148,7 @@ function showDownloadFeedback() {
 
 // 页面加载完成后启动定时器
 document.addEventListener('DOMContentLoaded', function() {
-    setInterval(updateElapsedTimes, 1000); // 每秒更新
+    setInterval(updateElapsedTimes, 1000);
 });
 
 // 对于动态加载的内容，也要启动定时器
@@ -174,48 +158,12 @@ setTimeout(() => {
 </script>
 """, unsafe_allow_html=True)
 
-# --- 3. Redis连接初始化（优化缓存） ---
-
-@st.cache_resource(ttl=300)
-def init_redis_connection():
-    """初始化Redis连接"""
-    try:
-        r = redis.Redis(
-            host=REDIS_HOST, port=REDIS_PORT,
-            decode_responses=False, username="default", password=REDIS_PASSWORD,
-            socket_timeout=3, socket_connect_timeout=3,
-            retry_on_timeout=True, health_check_interval=60
-        )
-        r.ping()
-        return r, None
-    except Exception as e:
-        return None, f"Redis连接失败: {str(e)}"
-
-r, redis_error = init_redis_connection()
-
-# --- 4. Session State管理 ---
+# --- 3. Session State管理 ---
 
 def get_session_key():
     if 'session_id' not in st.session_state:
         st.session_state.session_id = f"s_{int(time.time())}_{random.randint(100, 999)}"
     return st.session_state.session_id
-
-def save_session_data():
-    """异步保存会话数据"""
-    if not r:
-        return
-    try:
-        session_key = SESSION_DATA_PREFIX + get_session_key()
-        session_data = {
-            'tasks': [{'task_id': t.task_id, 'file_name': t.file_name, 'session_id': t.session_id,
-                      'status': t.status, 'progress': t.progress, 'retry_count': t.retry_count}
-                     for t in st.session_state.get('tasks', [])],
-            'task_counter': st.session_state.get('task_counter', 0),
-            'timestamp': time.time()
-        }
-        r.setex(session_key, 1800, pickle.dumps(session_data))
-    except:
-        pass
 
 # 初始化Session State
 if 'tasks' not in st.session_state:
@@ -228,8 +176,10 @@ if 'upload_success' not in st.session_state:
     st.session_state.upload_success = False
 if 'download_clicked' not in st.session_state:
     st.session_state.download_clicked = {}
+if 'task_queue' not in st.session_state:
+    st.session_state.task_queue = []
 
-# --- 5. 精简任务类 ---
+# --- 4. 任务类 ---
 
 class TaskItem:
     def __init__(self, task_id, file_data, file_name, session_id):
@@ -247,19 +197,15 @@ class TaskItem:
         self.elapsed_time = None
         self.retry_count = 0
 
-    def to_dict(self):
-        return {
-            'task_id': self.task_id, 'file_name': self.file_name, 'session_id': self.session_id,
-            'created_at': self.created_at.isoformat(), 'retry_count': self.retry_count
-        }
-
-# --- 6. 核心API函数 ---
+# --- 5. 核心API函数 ---
 
 def is_concurrent_limit_error(error_msg):
+    """检查是否为并发限制错误"""
     error_lower = error_msg.lower()
     return any(keyword in error_lower for keyword in CONCURRENT_LIMIT_ERRORS)
 
 def upload_file(file_data, file_name, api_key):
+    """上传文件到API"""
     url = 'https://www.runninghub.cn/task/openapi/upload'
     files = {'file': (file_name, file_data)}
     data = {'apiKey': api_key, 'fileType': 'image'}
@@ -267,11 +213,12 @@ def upload_file(file_data, file_name, api_key):
     response.raise_for_status()
     result = response.json()
     if result.get("code") == 0:
-        return result['data']['fileName']
+        return result['data'] ['fileName']
     else:
         raise Exception(f"上传失败: {result.get('msg', '未知错误')}")
 
 def run_task(api_key, webapp_id, node_info_list):
+    """启动API任务"""
     url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
     payload = {"apiKey": api_key, "webappId": webapp_id, "nodeInfoList": node_info_list}
     response = requests.post(url, headers={'Content-Type': 'application/json'}, 
@@ -280,33 +227,37 @@ def run_task(api_key, webapp_id, node_info_list):
     result = response.json()
     if result.get("code") != 0:
         raise Exception(f"任务发起失败: {result.get('msg', '未知错误')}")
-    return result['data']['taskId']
+    return result['data'] ['taskId']
 
 def get_task_status(api_key, task_id):
+    """获取任务状态"""
     url = 'https://www.runninghub.cn/task/openapi/status'
     response = requests.post(url, json={'apiKey': api_key, 'taskId': task_id}, timeout=10)
     response.raise_for_status()
     return response.json().get('data')
 
 def fetch_task_output(api_key, task_id):
+    """获取任务结果"""
     url = 'https://www.runninghub.cn/task/openapi/outputs'
     response = requests.post(url, json={'apiKey': api_key, 'taskId': task_id}, timeout=30)
     response.raise_for_status()
     data = response.json()
     if data.get("code") == 0 and data.get("data"):
-        file_url = data["data"][0].get("fileUrl")
+        file_url = data["data"] [0].get("fileUrl")
         if file_url:
             return file_url
     raise Exception(f"获取结果失败: {data.get('msg', '未找到结果')}")
 
 def download_result_image(url):
+    """下载结果图片"""
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
     return response.content
 
-# --- 7. 任务处理逻辑 ---
+# --- 6. 任务处理逻辑 ---
 
 def process_single_task(task, api_key, webapp_id, node_info):
+    """处理单个任务"""
     task.status = "PROCESSING"
     task.start_time = time.time()
 
@@ -336,9 +287,6 @@ def process_single_task(task, api_key, webapp_id, node_info):
             elif status == "FAILED":
                 raise Exception("API任务处理失败")
 
-            if poll_count % 20 == 0:
-                save_session_data()
-
         if poll_count >= MAX_POLL_COUNT:
             raise Exception(f"任务超时 (>{ACTUAL_TIMEOUT_MINUTES}分钟)")
 
@@ -349,7 +297,6 @@ def process_single_task(task, api_key, webapp_id, node_info):
         task.progress = 100
         task.status = "SUCCESS"
         task.elapsed_time = time.time() - task.start_time
-        save_session_data()
 
     except Exception as e:
         error_msg = str(e)
@@ -359,85 +306,63 @@ def process_single_task(task, api_key, webapp_id, node_info):
             task.retry_count += 1
             task.status = "QUEUED"
             task.progress = 0
+            # 添加到队列重新处理
+            st.session_state.task_queue.append(task)
             time.sleep((2 ** task.retry_count) + random.randint(1, 3))
-            if r:
-                queue_key = GLOBAL_TASK_QUEUE.encode()
-                task_data = json.dumps(task.to_dict()).encode()
-                r.rpush(queue_key, task_data)
         else:
             task.status = "FAILED"
             task.error_message = error_msg[:100]
 
-        save_session_data()
+# --- 7. 队列管理 ---
 
-    finally:
-        if r:
-            processing_key = GLOBAL_PROCESSING_SET.encode()
-            r.srem(processing_key, str(task.task_id))
-
-# --- 8. 队列管理 ---
-
-@st.cache_data(ttl=2)
-def get_queue_stats():
-    if not r:
-        return {'queued': 0, 'global_processing': 0, 'local_processing': 0}
-
-    try:
-        queue_key = GLOBAL_TASK_QUEUE.encode()
-        processing_key = GLOBAL_PROCESSING_SET.encode()
-
-        queued = r.llen(queue_key)
-        global_processing = r.scard(processing_key)
-        local_processing = sum(1 for t in st.session_state.tasks if t.status == "PROCESSING")
-
-        return {'queued': queued, 'global_processing': global_processing, 'local_processing': local_processing}
-    except:
-        return {'queued': 0, 'global_processing': 0, 'local_processing': 0}
+def get_stats():
+    """获取统计信息"""
+    processing_count = sum(1 for t in st.session_state.tasks if t.status == "PROCESSING")
+    queued_count = len(st.session_state.task_queue) + sum(1 for t in st.session_state.tasks if t.status == "QUEUED")
+    success_count = sum(1 for t in st.session_state.tasks if t.status == "SUCCESS")
+    failed_count = sum(1 for t in st.session_state.tasks if t.status == "FAILED")
+    
+    return {
+        'processing': processing_count,
+        'queued': queued_count,
+        'success': success_count,
+        'failed': failed_count,
+        'total': len(st.session_state.tasks)
+    }
 
 def start_new_tasks():
-    if not r:
+    """启动新任务"""
+    stats = get_stats()
+    available_slots = MAX_CONCURRENT - stats['processing']
+    
+    if available_slots <= 0:
         return
-
-    try:
-        stats = get_queue_stats()
-        available_slots = min(
-            MAX_GLOBAL_CONCURRENT - stats['global_processing'],
-            MAX_LOCAL_CONCURRENT - stats['local_processing']
+    
+    # 处理队列中的任务
+    for _ in range(min(available_slots, len(st.session_state.task_queue))):
+        if st.session_state.task_queue:
+            task = st.session_state.task_queue.pop(0)
+            
+            thread = threading.Thread(
+                target=process_single_task,
+                args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
+            )
+            thread.daemon = True
+            thread.start()
+    
+    # 处理状态为QUEUED的任务
+    queued_tasks = [t for t in st.session_state.tasks if t.status == "QUEUED"]
+    remaining_slots = MAX_CONCURRENT - stats['processing'] - len([t for t in st.session_state.tasks if t.status == "PROCESSING"])
+    
+    for task in queued_tasks[:remaining_slots]:
+        thread = threading.Thread(
+            target=process_single_task,
+            args=(task, API_KEY, WEBAPP_ID, NODE_INFO)
         )
+        thread.daemon = True
+        thread.start()
 
-        if available_slots <= 0:
-            return
-
-        queue_key = GLOBAL_TASK_QUEUE.encode()
-        processing_key = GLOBAL_PROCESSING_SET.encode()
-
-        for _ in range(available_slots):
-            task_data_bytes = r.lpop(queue_key)
-            if not task_data_bytes:
-                break
-
-            task_data = json.loads(task_data_bytes.decode())
-            task_id = task_data['task_id']
-
-            local_task = next((t for t in st.session_state.tasks if t.task_id == task_id), None)
-
-            if local_task and local_task.file_data:
-                local_task.retry_count = task_data.get('retry_count', 0)
-                r.sadd(processing_key, str(task_id))
-
-                thread = threading.Thread(
-                    target=process_single_task,
-                    args=(local_task, API_KEY, WEBAPP_ID, NODE_INFO)
-                )
-                thread.daemon = True
-                thread.start()
-            else:
-                r.rpush(queue_key, task_data_bytes)
-
-    except:
-        pass
-
-# --- 9. 优化下载按钮组件 ---
+# --- 8. 下载按钮组件 ---
 
 def create_download_button(task):
     """创建优化的下载按钮"""
@@ -448,7 +373,6 @@ def create_download_button(task):
     clicked = st.session_state.download_clicked.get(task.task_id, False)
     if clicked:
         st.session_state.download_clicked[task.task_id] = False
-
         # 显示即时反馈
         components.html("""
         <script>
@@ -474,13 +398,13 @@ def create_download_button(task):
         st.session_state.download_clicked[task.task_id] = True
         st.rerun()
 
-# --- 10. 主界面 ---
+# --- 9. 主界面 ---
 
 def main():
     st.title("🎨 RunningHub AI - 智能图片优化工具")
-    st.caption("高效处理 • 快速响应 • 实时更新")
+    st.caption("本地并发处理 • 快速响应 • 实时更新")
 
-    st.info(f"⏱️ 预计处理时间: {DISPLAY_TIMEOUT_MINUTES}分钟 | 🔄 刷新间隔: {AUTO_REFRESH_INTERVAL}秒")
+    st.info(f"⏱️ 预计处理时间: {DISPLAY_TIMEOUT_MINUTES}分钟 | 🔄 刷新间隔: {AUTO_REFRESH_INTERVAL}秒 | 📊 最大并发: {MAX_CONCURRENT}")
     st.divider()
 
     # 主界面布局
@@ -498,71 +422,50 @@ def main():
             "选择图片文件",
             type=['png', 'jpg', 'jpeg', 'webp'],
             accept_multiple_files=True,
-            help="支持批量上传，自动加入全局队列",
+            help="支持批量上传，自动加入处理队列",
             key=f"uploader_{st.session_state.file_uploader_key}"
         )
 
         if uploaded_files:
-            if not r:
-                st.error("⚠️ Redis连接失败")
-            else:
-                with st.spinner(f'添加 {len(uploaded_files)} 个文件...'):
-                    new_tasks = []
-                    for file in uploaded_files:
-                        st.session_state.task_counter += 1
-                        task = TaskItem(
-                            st.session_state.task_counter, file.getvalue(), 
-                            file.name, get_session_key()
-                        )
-                        st.session_state.tasks.append(task)
-                        new_tasks.append(task)
+            with st.spinner(f'添加 {len(uploaded_files)} 个文件...'):
+                for file in uploaded_files:
+                    st.session_state.task_counter += 1
+                    task = TaskItem(
+                        st.session_state.task_counter, file.getvalue(), 
+                        file.name, get_session_key()
+                    )
+                    st.session_state.tasks.append(task)
+                    st.session_state.task_queue.append(task)
 
-                try:
-                    queue_key = GLOBAL_TASK_QUEUE.encode()
-                    pipe = r.pipeline()
-                    for task in new_tasks:
-                        task_data = json.dumps(task.to_dict()).encode()
-                        pipe.rpush(queue_key, task_data)
-                    pipe.execute()
-
-                    save_session_data()
-                    st.session_state.upload_success = True
-                    st.session_state.file_uploader_key += 1
-                    st.rerun()
-
-                except Exception as e:
-                    st.error(f"❌ 添加失败: {str(e)[:50]}...")
+                st.session_state.upload_success = True
+                st.session_state.file_uploader_key += 1
+                st.rerun()
 
         st.divider()
 
         # 状态面板
         with st.expander("📊 系统状态", expanded=True):
-            stats = get_queue_stats()
-            local_stats = {
-                'success': sum(1 for t in st.session_state.tasks if t.status == "SUCCESS"),
-                'failed': sum(1 for t in st.session_state.tasks if t.status == "FAILED"),
-                'total': len(st.session_state.tasks)
-            }
+            stats = get_stats()
 
             c1, c2, c3 = st.columns(3)
 
             with c1:
-                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#0066cc">{stats["queued"]}</h4><p style="margin:0;font-size:11px">队列</p></div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#28a745">{local_stats["success"]}</h4><p style="margin:0;font-size:11px">完成</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#6f42c1">{stats["queued"]}</h4><p style="margin:0;font-size:11px">队列</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#28a745">{stats["success"]}</h4><p style="margin:0;font-size:11px">完成</p></div>', unsafe_allow_html=True)
 
             with c2:
-                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#6f42c1">{stats["global_processing"]}/{MAX_GLOBAL_CONCURRENT}</h4><p style="margin:0;font-size:11px">全局</p></div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#dc3545">{local_stats["failed"]}</h4><p style="margin:0;font-size:11px">失败</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#fd7e14">{stats["processing"]}/{MAX_CONCURRENT}</h4><p style="margin:0;font-size:11px">处理中</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#dc3545">{stats["failed"]}</h4><p style="margin:0;font-size:11px">失败</p></div>', unsafe_allow_html=True)
 
             with c3:
-                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#fd7e14">{stats["local_processing"]}/{MAX_LOCAL_CONCURRENT}</h4><p style="margin:0;font-size:11px">本页</p></div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#6c757d">{local_stats["total"]}</h4><p style="margin:0;font-size:11px">总数</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#6c757d">{stats["total"]}</h4><p style="margin:0;font-size:11px">总数</p></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="metric-box"><h4 style="margin:0;color:#0066cc">{len(st.session_state.task_queue)}</h4><p style="margin:0;font-size:11px">等待</p></div>', unsafe_allow_html=True)
 
         # 系统信息
         with st.expander("⚙️ 系统信息", expanded=False):
-            st.text(f"Redis: {'✅连接' if r else '❌断开'}")
-            st.text(f"会话: {get_session_key()}")
-            st.text(f"配置: {MAX_GLOBAL_CONCURRENT}全局/{MAX_LOCAL_CONCURRENT}本地并发")
+            st.text(f"会话ID: {get_session_key()}")
+            st.text(f"并发限制: {MAX_CONCURRENT}")
+            st.text(f"总任务数: 无限制")
 
     # 右侧：任务列表
     with right_col:
@@ -601,7 +504,6 @@ def main():
                         st.progress(task.progress / 100, text=f"进度: {int(task.progress)}%")
 
                         if task.start_time:
-                            # 使用JavaScript实现实时时间更新
                             st.markdown(f'''
                             <div class="compact-info real-time" 
                                  data-start-time="{task.start_time}" 
@@ -617,8 +519,6 @@ def main():
                     if task.status == "SUCCESS" and task.result_data:
                         elapsed_str = f"{int(task.elapsed_time//60)}:{int(task.elapsed_time%60):02d}"
                         st.success(f"🎉 处理完成! 用时: {elapsed_str}")
-
-                        # 使用优化的下载按钮
                         create_download_button(task)
 
                     elif task.status == "FAILED":
@@ -631,49 +531,45 @@ def main():
             st.divider()
 
             # 操作按钮
-            col1, col2, col3 = st.columns(3)
+            col1, col2 = st.columns(2)
 
             with col1:
-                if st.button("🗑️ 清空本页"):
+                if st.button("🗑️ 清空任务", use_container_width=True):
                     st.session_state.tasks = []
+                    st.session_state.task_queue = []
                     st.session_state.download_clicked = {}
-                    save_session_data()
                     st.rerun()
 
             with col2:
-                if r and st.button("🔥 清空全局"):
-                    try:
-                        r.delete(GLOBAL_TASK_QUEUE.encode(), GLOBAL_PROCESSING_SET.encode())
-                        st.session_state.tasks = []
-                        st.session_state.download_clicked = {}
-                        save_session_data()
-                        st.success("✅ 已清空")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ 失败: {str(e)[:30]}...")
-
-            with col3:
-                if st.button("💾 保存数据"):
-                    save_session_data()
-                    st.success("✅ 已保存")
+                if st.button("🔄 重新启动队列", use_container_width=True):
+                    # 将失败的任务重新加入队列
+                    failed_tasks = [t for t in st.session_state.tasks if t.status == "FAILED"]
+                    for task in failed_tasks:
+                        task.status = "QUEUED"
+                        task.retry_count = 0
+                        task.error_message = None
+                        task.progress = 0
+                        st.session_state.task_queue.append(task)
+                    st.success(f"✅ 已重启 {len(failed_tasks)} 个失败任务")
+                    st.rerun()
 
     # 页脚
     st.divider()
     st.markdown("""
     <div style='text-align: center; color: #6c757d; padding: 15px;'>
-        <b>🚀 RunningHub AI - 实时响应版</b><br>
-        <small>快速下载 • 实时时间更新 • 即时反馈</small>
+        <b>🚀 RunningHub AI - 本地并发版</b><br>
+        <small>5个并发限制 • 无总数限制 • 即时反馈</small>
     </div>
     """, unsafe_allow_html=True)
 
-# --- 11. 应用入口 ---
+# --- 10. 应用入口 ---
 
 if __name__ == "__main__":
     try:
         main()
 
         # 优化刷新逻辑
-        has_active_tasks = any(t.status in ["PROCESSING", "QUEUED"] for t in st.session_state.tasks)
+        has_active_tasks = any(t.status in ["PROCESSING", "QUEUED"] for t in st.session_state.tasks) or len(st.session_state.task_queue) > 0
 
         if has_active_tasks:
             time.sleep(AUTO_REFRESH_INTERVAL)
