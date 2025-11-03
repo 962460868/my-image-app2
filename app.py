@@ -23,7 +23,7 @@ logging.getLogger("tornado.application").setLevel(logging.ERROR)
 logging.getLogger("tornado.general").setLevel(logging.ERROR)
 
 # API配置
-API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
+API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"
 WEBAPP_ID = "1947599512657453057"
 NODE_INFO = [
     {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
