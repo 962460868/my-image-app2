@@ -41,8 +41,8 @@ NODE_INFO = [
 
 # 系统配置
 MAX_GLOBAL_CONCURRENT = 10  
-MAX_LOCAL_CONCURRENT = 3   
-MAX_RETRIES = 3            
+MAX_LOCAL_CONCURRENT = 5   
+MAX_RETRIES = 5            
 POLL_INTERVAL = 3          
 MAX_POLL_COUNT = 300       
 AUTO_REFRESH_INTERVAL = 6  # 减少到6秒以提高响应性
