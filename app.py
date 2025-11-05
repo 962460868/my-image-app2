@@ -22,13 +22,12 @@ logging.getLogger("tornado.access").setLevel(logging.ERROR)
 logging.getLogger("tornado.application").setLevel(logging.ERROR)
 logging.getLogger("tornado.general").setLevel(logging.ERROR)
 
-# API配置
-API_KEY = "9394a5c6d9454cd2b31e24661dd11c3d"
-WEBAPP_ID = "1947599512657453057"
+# 更新API配置
+API_KEY = "c95f4c4d2703479abfbc55eefeb9bb71"
+WEBAPP_ID = "1975745173911154689"
 NODE_INFO = [
-    {"nodeId": "38", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片输入"},
-    {"nodeId": "60", "fieldName": "text", "fieldValue": "8k, high quality, high detail", "description": "正向提示词补充"},
-    {"nodeId": "4", "fieldName": "text", "fieldValue": "色调艳丽,过曝,静态,细节模糊不清,字幕,风格,作品,画作,画面,静止,整体发灰,最差质量,低质量,JPEG压缩残留,丑陋的,残缺的,多余的手指,画得不好的手部,画得不好的脸部,畸形的,毁容的,形态畸形的肢体,手指融合,静止不动的画面,悲乱的背景,三条腿,背景人很多,倒着走", "description": "反向提示词"}
+    {"nodeId": "245", "fieldName": "image", "fieldValue": "placeholder.png", "description": "图片"},
+    {"nodeId": "244", "fieldName": "image", "fieldValue": "placeholder.png", "description": "姿势参考图"}
 ]
 
 # 系统配置
@@ -88,6 +87,19 @@ st.markdown("""
         background-color: #f8f9fa;
         padding: 2px 6px;
         border-radius: 3px;
+    }
+    .upload-container {
+        border: 2px dashed #0066cc;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        background: #f8f9fa;
+    }
+    .image-preview {
+        max-width: 100%;
+        max-height: 200px;
+        border-radius: 6px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .download-feedback {
         position: fixed;
@@ -182,10 +194,12 @@ if 'task_queue' not in st.session_state:
 # --- 4. 任务类 ---
 
 class TaskItem:
-    def __init__(self, task_id, file_data, file_name, session_id):
+    def __init__(self, task_id, main_image_data, main_image_name, reference_image_data, reference_image_name, session_id):
         self.task_id = task_id
-        self.file_data = file_data
-        self.file_name = file_name
+        self.main_image_data = main_image_data
+        self.main_image_name = main_image_name
+        self.reference_image_data = reference_image_data
+        self.reference_image_name = reference_image_name
         self.session_id = session_id
         self.status = "QUEUED"
         self.progress = 0
@@ -213,21 +227,21 @@ def upload_file(file_data, file_name, api_key):
     response.raise_for_status()
     result = response.json()
     if result.get("code") == 0:
-        return result['data'] ['fileName']
+        return result['data']['fileName']
     else:
         raise Exception(f"上传失败: {result.get('msg', '未知错误')}")
 
 def run_task(api_key, webapp_id, node_info_list):
     """启动API任务"""
     url = 'https://www.runninghub.cn/task/openapi/ai-app/run'
+    headers = {'Host': 'www.runninghub.cn', 'Content-Type': 'application/json'}
     payload = {"apiKey": api_key, "webappId": webapp_id, "nodeInfoList": node_info_list}
-    response = requests.post(url, headers={'Content-Type': 'application/json'}, 
-                           json=payload, timeout=30)
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     response.raise_for_status()
     result = response.json()
     if result.get("code") != 0:
         raise Exception(f"任务发起失败: {result.get('msg', '未知错误')}")
-    return result['data'] ['taskId']
+    return result['data']['taskId']
 
 def get_task_status(api_key, task_id):
     """获取任务状态"""
@@ -243,7 +257,7 @@ def fetch_task_output(api_key, task_id):
     response.raise_for_status()
     data = response.json()
     if data.get("code") == 0 and data.get("data"):
-        file_url = data["data"] [0].get("fileUrl")
+        file_url = data["data"][0].get("fileUrl")
         if file_url:
             return file_url
     raise Exception(f"获取结果失败: {data.get('msg', '未找到结果')}")
@@ -262,14 +276,22 @@ def process_single_task(task, api_key, webapp_id, node_info):
     task.start_time = time.time()
 
     try:
-        task.progress = 15
-        uploaded_filename = upload_file(task.file_data, task.file_name, api_key)
+        # 上传主图片
+        task.progress = 10
+        main_uploaded_filename = upload_file(task.main_image_data, task.main_image_name, api_key)
 
+        # 上传姿势参考图
+        task.progress = 20
+        reference_uploaded_filename = upload_file(task.reference_image_data, task.reference_image_name, api_key)
+
+        # 构建节点信息
         task.progress = 25
         node_info_list = copy.deepcopy(node_info)
         for node in node_info_list:
-            if node["nodeId"] == "38":
-                node["fieldValue"] = uploaded_filename
+            if node["nodeId"] == "245":  # 主图片
+                node["fieldValue"] = main_uploaded_filename
+            elif node["nodeId"] == "244":  # 姿势参考图
+                node["fieldValue"] = reference_uploaded_filename
 
         task.progress = 35
         task.api_task_id = run_task(api_key, webapp_id, node_info_list)
@@ -387,7 +409,7 @@ def create_download_button(task):
     downloaded = st.download_button(
         label=f"📥 下载结果 ({file_size:.1f}KB)",
         data=task.result_data,
-        file_name=f"optimized_{task.file_name}",
+        file_name=f"optimized_{task.main_image_name}",
         mime="image/png",
         key=button_key,
         use_container_width=True,
@@ -402,7 +424,7 @@ def create_download_button(task):
 
 def main():
     st.title("🎨 RunningHub AI - 智能图片优化工具")
-    st.caption("本地并发处理 • 快速响应 • 实时更新")
+    st.caption("双图片处理模式 • 主图片 + 姿势参考图 • 快速响应 • 实时更新")
 
     st.info(f"⏱️ 预计处理时间: {DISPLAY_TIMEOUT_MINUTES}分钟 | 🔄 刷新间隔: {AUTO_REFRESH_INTERVAL}秒 | 📊 最大并发: {MAX_CONCURRENT}")
     st.divider()
@@ -412,27 +434,54 @@ def main():
 
     # 左侧：上传和状态
     with left_col:
-        st.markdown("### 📁 文件上传")
+        st.markdown("### 📁 双图片上传")
+        
+        st.info("💡 需要同时上传主图片和姿势参考图才能开始处理")
 
         if st.session_state.upload_success:
-            st.success("✅ 文件已添加到处理队列!")
+            st.success("✅ 任务已添加到处理队列!")
             st.session_state.upload_success = False
 
-        uploaded_files = st.file_uploader(
-            "选择图片文件",
+        # 主图片上传
+        st.markdown('<div class="upload-container">', unsafe_allow_html=True)
+        st.markdown("**📷 主图片**")
+        main_image = st.file_uploader(
+            "选择主图片",
             type=['png', 'jpg', 'jpeg', 'webp'],
-            accept_multiple_files=True,
-            help="支持批量上传，自动加入处理队列",
-            key=f"uploader_{st.session_state.file_uploader_key}"
+            accept_multiple_files=False,
+            help="选择需要处理的主要图片",
+            key=f"main_uploader_{st.session_state.file_uploader_key}"
         )
+        if main_image:
+            st.image(main_image, caption="主图片预览", use_column_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        if uploaded_files:
-            with st.spinner(f'添加 {len(uploaded_files)} 个文件...'):
-                for file in uploaded_files:
+        # 姿势参考图上传
+        st.markdown('<div class="upload-container">', unsafe_allow_html=True)
+        st.markdown("**🤸 姿势参考图**")
+        reference_image = st.file_uploader(
+            "选择姿势参考图",
+            type=['png', 'jpg', 'jpeg', 'webp'],
+            accept_multiple_files=False,
+            help="选择作为姿势参考的图片",
+            key=f"reference_uploader_{st.session_state.file_uploader_key}"
+        )
+        if reference_image:
+            st.image(reference_image, caption="参考图预览", use_column_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # 开始处理按钮
+        if st.button("🚀 开始处理", use_container_width=True, type="primary"):
+            if main_image and reference_image:
+                with st.spinner('添加任务到队列...'):
                     st.session_state.task_counter += 1
                     task = TaskItem(
-                        st.session_state.task_counter, file.getvalue(), 
-                        file.name, get_session_key()
+                        st.session_state.task_counter, 
+                        main_image.getvalue(), 
+                        main_image.name,
+                        reference_image.getvalue(),
+                        reference_image.name,
+                        get_session_key()
                     )
                     st.session_state.tasks.append(task)
                     st.session_state.task_queue.append(task)
@@ -440,6 +489,8 @@ def main():
                 st.session_state.upload_success = True
                 st.session_state.file_uploader_key += 1
                 st.rerun()
+            else:
+                st.error("❌ 请同时上传主图片和姿势参考图！")
 
         st.divider()
 
@@ -465,14 +516,14 @@ def main():
         with st.expander("⚙️ 系统信息", expanded=False):
             st.text(f"会话ID: {get_session_key()}")
             st.text(f"并发限制: {MAX_CONCURRENT}")
-            st.text(f"总任务数: 无限制")
+            st.text(f"处理模式: 双图片上传")
 
     # 右侧：任务列表
     with right_col:
         st.markdown("### 📋 任务列表")
 
         if not st.session_state.tasks:
-            st.info("💡 暂无任务，请上传文件开始处理")
+            st.info("💡 暂无任务，请上传双图片开始处理")
         else:
             start_new_tasks()
 
@@ -485,7 +536,9 @@ def main():
                     col1, col2 = st.columns([4, 1])
 
                     with col1:
-                        st.markdown(f"**{task.file_name}** `#{task.task_id}`")
+                        st.markdown(f"**主图: {task.main_image_name}** `#{task.task_id}`")
+                        st.markdown(f'<div class="compact-info">📷 主图: {task.main_image_name}</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="compact-info">🤸 参考: {task.reference_image_name}</div>', unsafe_allow_html=True)
                         if task.retry_count > 0:
                             st.markdown(f'<div class="compact-info">🔄 重试 {task.retry_count}/{MAX_RETRIES}</div>', unsafe_allow_html=True)
 
@@ -557,8 +610,8 @@ def main():
     st.divider()
     st.markdown("""
     <div style='text-align: center; color: #6c757d; padding: 15px;'>
-        <b>🚀 RunningHub AI - 本地并发版</b><br>
-        <small>5个并发限制 • 无总数限制 • 即时反馈</small>
+        <b>🚀 RunningHub AI - 双图片处理版</b><br>
+        <small>主图片 + 姿势参考图 • 5个并发限制 • 即时反馈</small>
     </div>
     """, unsafe_allow_html=True)
 
